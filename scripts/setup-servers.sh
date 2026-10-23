@@ -91,7 +91,7 @@ extract_payload() {
   else                                                                          # run through curl: fetch the repo here
     command -v curl >/dev/null || die "curl is required on this machine"
     info "downloading fwpanel from GitHub"
-    curl -fsSL -m 120 "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$WORK" || die "download failed (GitHub unreachable from this machine?)"
+    curl -fsSL --connect-timeout 10 -m 120 "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$WORK" || die "download failed (GitHub unreachable from this machine?)"
     src="$(find "$WORK" -mindepth 1 -maxdepth 1 -type d -name 'fwpanel-*' | head -1)"
     [ -f "$src/src/fwpanel.py" ] || die "unexpected download layout"
   fi

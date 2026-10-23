@@ -63,12 +63,12 @@ fi
 if [ -n "$VERSION" ]; then
   REF="refs/tags/$VERSION"
 else
-  TAG="$(curl -fsSL -m 15 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+  TAG="$(curl -fsSL --connect-timeout 8 -m 15 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
   if [ -n "$TAG" ]; then REF="refs/tags/$TAG"; VERSION="$TAG"; else REF="refs/heads/main"; VERSION="main"; fi
 fi
 info "downloading fwpanel $VERSION"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-curl -fsSL -m 120 "https://github.com/$REPO/archive/$REF.tar.gz" | tar -xz -C "$TMP" \
+curl -fsSL --connect-timeout 10 -m 120 "https://github.com/$REPO/archive/$REF.tar.gz" | tar -xz -C "$TMP" \
   || die "download failed. Is GitHub reachable from this server? (On Iranian servers it often is not: use the offline installer created by your foreign panel.)"
 SRC="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)"
 [ -f "$SRC/src/fwpanel.py" ] || die "unexpected download layout"
