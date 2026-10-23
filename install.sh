@@ -115,7 +115,8 @@ PASSWORD="$(printf '%s\n' "$OUT" | sed -n 's/^PASSWORD=//p' | head -1)"
 ADDR="$(printf '%s\n' "$OUT" | sed -n 's/^fwpanel is running: *//p' | head -1)"
 
 echo
-printf "${green}${bold}fwpanel %s is installed and running.${plain}\n" "$VERSION"
+INSTALLED="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' /opt/fwpanel/fwpanel.py | head -1)"
+printf "${green}${bold}fwpanel %s is installed and running.${plain}\n" "${INSTALLED:-$VERSION}"
 echo "------------------------------------------------------------"
 echo "  Panel address : ${ADDR:-see: fwpanel info}"
 if [ -n "$PASSWORD" ]; then
