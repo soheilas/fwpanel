@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fwpanel-setup - set up everything, 0 to 100, from one command:
-#   panel on the foreign server, panel on every Iran server, the GRE6 tunnel between them,
+#   panel on the foreign server, panel on every Iran server, the GRE tunnel (GRE6 or GRE4) between them,
 #   automatic rule sync, and (optionally) your first forwards.
 #
 # Run it from any Linux/macOS machine (or WSL / Git Bash) that can SSH to the servers as root,
@@ -17,7 +17,8 @@
 #   --key FILE                 SSH private key (otherwise ssh asks for the passwords itself)
 #   --panel-port N             panel port on every server (default 9443)
 #   --https                    serve panels over HTTPS (self-signed) instead of plain HTTP
-#   --no-tunnel                skip the GRE6 tunnel: Iran forwards straight to the foreign server's public IP
+#   --tunnel-type T            auto (default) | gre6 | gre4.  auto: GRE6 over a working IPv6 pair, otherwise GRE4 over the public IPv4s
+#   --no-tunnel                no tunnel at all: Iran forwards straight to the foreign server's public IP
 #   --tunnel-net A.B.C         private range for tunnels (default 192.168.70) - one /30 per Iran server
 #   --foreign-ip IP            public IPv4 of the foreign server (only needed with --no-tunnel or behind NAT)
 #   --rule PORT=IP[:DPORT]     create a forward on the foreign panel (TCP+UDP); repeatable. DPORT defaults to PORT
@@ -29,7 +30,7 @@ set -uo pipefail
 
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "error: bash 4+ is required (on macOS: brew install bash, or run it on a Linux box / WSL)" >&2; exit 1; }
 
-FOREIGN=""; IRANS=(); KEY=""; PPORT=9443; SCHEME=http; TUNNEL=1; NET=192.168.70; FIP=""; RULES=(); YES=0; REPLACE=""
+FOREIGN=""; IRANS=(); KEY=""; PPORT=9443; SCHEME=http; TUNNEL=1; TTYPE=auto; NET=192.168.70; FIP=""; RULES=(); YES=0; REPLACE=""
 
 die()  { echo "error: $*" >&2; exit 1; }
 say()  { echo; echo "==> $*"; }
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
     --panel-port) PPORT="${2:-}"; shift 2 ;;
     --https)      SCHEME=https; shift ;;
     --no-tunnel)  TUNNEL=0; shift ;;
+    --tunnel-type) TTYPE="${2:-}"; shift 2 ;;
     --tunnel-net) NET="${2:-}"; shift 2 ;;
     --foreign-ip) FIP="${2:-}"; shift 2 ;;
     --rule)       RULES+=("${2:-}"); shift 2 ;;
@@ -56,6 +58,7 @@ done
 [ ${#IRANS[@]} -gt 0 ] || die "give at least one --iran server"
 [[ "$PPORT" =~ ^[0-9]+$ ]] && [ "$PPORT" -ge 1 ] && [ "$PPORT" -le 65535 ] || die "bad --panel-port"
 [[ "$NET" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--tunnel-net must look like 192.168.70"
+[[ "$TTYPE" =~ ^(auto|gre6|gre4)$ ]] || die "--tunnel-type must be auto, gre6 or gre4"
 [ ${#IRANS[@]} -le 60 ] || die "too many Iran servers for one tunnel range"
 
 WORK="$(mktemp -d)"
@@ -122,7 +125,7 @@ say "plan"
 info "foreign server : $FOREIGN"
 for i in "${!IRANS[@]}"; do info "iran server $((i+1))  : ${IRANS[$i]}"; done
 info "panels         : $SCHEME, port $PPORT"
-info "connection     : $([ "$TUNNEL" = 1 ] && echo "GRE6 tunnel (range $NET.0/24), automatic IPv6 selection" || echo "direct over the public internet (no tunnel)")"
+info "connection     : $([ "$TUNNEL" = 1 ] && echo "GRE tunnel, type $TTYPE (range $NET.0/24)" || echo "direct over the public internet (no tunnel)")"
 [ ${#RULES[@]} -eq 0 ] || info "first forwards : ${RULES[*]}"
 if [ "$YES" != 1 ]; then read -r -p "    continue? [y/N] " a; [[ "$a" =~ ^[Yy] ]] || { echo "aborted."; exit 1; }; fi
 
@@ -161,23 +164,34 @@ declare -a LINK_IDS=() IRAN_PW=() IRAN_URL=() IRAN_NOTE=()
 for i in "${!IRANS[@]}"; do
   IT="${IRANS[$i]}"; IH="$(host_of "$IT")"; N=$((i+1)); B=$((i*4))
   say "3/6 Iran server $N ($IH): tunnel + link"
-  USE_T=0; FV6=""; IV6=""
+  USE_T=0; KIND=""; FEP=""; IEP=""
   if [ "$TUNNEL" = 1 ]; then
-    mapfile -t FL < <(v6_list "$FOREIGN"); mapfile -t IL < <(v6_list "$IT")
-    info "IPv6 on foreign: ${FL[*]:-none}"; info "IPv6 on iran   : ${IL[*]:-none}"
-    for fv in "${FL[@]:-}"; do
-      for iv in "${IL[@]:-}"; do
-        [ -n "$fv" ] && [ -n "$iv" ] || continue
-        if rsh "$FOREIGN" "ping -6 -c2 -W2 -I $fv $iv >/dev/null 2>&1" && rsh "$IT" "ping -6 -c2 -W2 -I $iv $fv >/dev/null 2>&1"; then
-          FV6="$fv"; IV6="$iv"; USE_T=1; break 2
-        fi
+    if [ "$TTYPE" = auto ] || [ "$TTYPE" = gre6 ]; then
+      mapfile -t FL < <(v6_list "$FOREIGN"); mapfile -t IL < <(v6_list "$IT")
+      info "IPv6 on foreign: ${FL[*]:-none}"; info "IPv6 on iran   : ${IL[*]:-none}"
+      for fv in "${FL[@]:-}"; do
+        for iv in "${IL[@]:-}"; do
+          [ -n "$fv" ] && [ -n "$iv" ] || continue
+          if rsh "$FOREIGN" "ping -6 -c2 -W2 -I $fv $iv >/dev/null 2>&1" && rsh "$IT" "ping -6 -c2 -W2 -I $iv $fv >/dev/null 2>&1"; then
+            FEP="$fv"; IEP="$iv"; KIND=gre6; USE_T=1; break 2
+          fi
+        done
       done
-    done
-    if [ "$USE_T" = 1 ]; then info "working IPv6 pair: $FV6 <-> $IV6"; else info "WARNING: no working IPv6 path between the servers; falling back to a direct connection for this server"; fi
+      if [ "$USE_T" = 1 ]; then info "working IPv6 pair: $FEP <-> $IEP (GRE6)"; else info "no working IPv6 path between the servers"; fi
+    fi
+    if [ "$USE_T" = 0 ] && { [ "$TTYPE" = auto ] || [ "$TTYPE" = gre4 ]; }; then
+      # GRE4: the outer addresses are the public IPv4s; needs IP protocol 47 allowed and no NAT in front of the foreign server
+      if [[ "$IH" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ -n "$FIPV4" ] && [ "$FIPV4" = "$FIP" ]; then
+        FEP="$FIPV4"; IEP="$IH"; KIND=gre4; USE_T=1; info "using GRE4 over IPv4: $FEP <-> $IEP"
+      else
+        info "GRE4 is not possible here (needs a public IPv4 on both servers, no NAT; foreign IPv4 is '${FIPV4:-?}', public '${FIP:-?}')"
+      fi
+    fi
+    [ "$USE_T" = 1 ] || info "WARNING: no tunnel possible; falling back to a direct connection for this server"
   fi
   TNAME="tun$N"; TF="$NET.$((B+2))"; TI="$NET.$((B+1))"
   if [ "$USE_T" = 1 ]; then
-    BODY="{\"name\":\"Iran-$N\",\"port\":$PPORT,\"scheme\":\"$SCHEME\",\"iran_ip\":\"$IH\",\"target_ip\":\"$FIP\",\"tunnel\":{\"enabled\":true,\"name\":\"$TNAME\",\"foreign_v6\":\"$FV6\",\"iran_v6\":\"$IV6\",\"foreign_ip\":\"$TF\",\"iran_ip\":\"$TI\"}}"
+    BODY="{\"name\":\"Iran-$N\",\"port\":$PPORT,\"scheme\":\"$SCHEME\",\"iran_ip\":\"$IH\",\"target_ip\":\"$FIP\",\"tunnel\":{\"enabled\":true,\"name\":\"$TNAME\",\"kind\":\"$KIND\",\"foreign_ep\":\"$FEP\",\"iran_ep\":\"$IEP\",\"foreign_ip\":\"$TF\",\"iran_ip\":\"$TI\"}}"
   else
     [ -n "$FIP" ] || die "need --foreign-ip for a direct connection"
     BODY="{\"name\":\"Iran-$N\",\"port\":$PPORT,\"scheme\":\"$SCHEME\",\"iran_ip\":\"$IH\",\"target_ip\":\"$FIP\"}"
@@ -185,7 +199,7 @@ for i in "${!IRANS[@]}"; do
   RESP="$(printf '%s' "$BODY" | fadmin POST /api/links/new-iran - 2>&1)" || die "creating the link failed: $RESP"
   LID="$(printf '%s' "$RESP" | jget 'd["link"]["id"]')" || die "unexpected answer: $RESP"
   LINK_IDS+=("$LID")
-  info "link #$LID created$([ "$USE_T" = 1 ] && echo " (tunnel $TNAME: foreign $TF <-> iran $TI)")"
+  info "link #$LID created$([ "$USE_T" = 1 ] && echo " (tunnel $TNAME/$KIND: foreign $TF <-> iran $TI)")"
 
   say "4/6 Iran server $N ($IH): installing the panel"
   fadmin GET "/api/links/$LID/installer" > "$WORK/iran$N.sh" || die "could not generate the Iran installer"
@@ -194,7 +208,7 @@ for i in "${!IRANS[@]}"; do
   printf '%s\n' "$IOUT" | sed 's/^/    | /'
   [ $IRC -eq 0 ] || die "installation failed on $IH"
   IRAN_PW+=("$(pw_of "$IOUT")")
-  if [ "$USE_T" = 1 ]; then IRAN_URL+=("$SCHEME://$IH:$PPORT/"); IRAN_NOTE+=("tunnel $TNAME  $TI <-> $TF"); else IRAN_URL+=("$SCHEME://$IH:$PPORT/"); IRAN_NOTE+=("direct to $FIP"); fi
+  if [ "$USE_T" = 1 ]; then IRAN_URL+=("$SCHEME://$IH:$PPORT/"); IRAN_NOTE+=("tunnel $TNAME ($KIND)  $TI <-> $TF"); else IRAN_URL+=("$SCHEME://$IH:$PPORT/"); IRAN_NOTE+=("direct to $FIP"); fi
 done
 
 # ---------------------------------------------------------------- 5. forwards
@@ -221,7 +235,7 @@ done
 for i in "${!IRANS[@]}"; do
   TF="$NET.$((i*4+2))"; TI="$NET.$((i*4+1))"
   if [[ "${IRAN_NOTE[$i]}" == tunnel* ]]; then
-    rsh "$FOREIGN" "ping -c2 -W2 $TI >/dev/null 2>&1" && info "tunnel $TF <-> $TI : OK" || info "tunnel $TF <-> $TI : NO REPLY (check IPv6 / firewall)"
+    rsh "$FOREIGN" "ping -c2 -W2 $TI >/dev/null 2>&1" && info "tunnel $TF <-> $TI : OK" || info "tunnel $TF <-> $TI : NO REPLY (GRE4: protocol 47 may be blocked - retry with --tunnel-type gre6 or --no-tunnel; GRE6: check IPv6 / firewall)"
   fi
 done
 

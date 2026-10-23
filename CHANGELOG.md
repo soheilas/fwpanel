@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.0
+- GRE4 (GRE over IPv4) tunnels next to GRE6: tunnel type choice in the "add Iran server" wizard, `--kind gre4|gre6` in the installer,
+  `--tunnel-type auto|gre6|gre4` in the two-server setup script (auto = GRE6 over a working IPv6 pair, otherwise GRE4).
+
 ## 1.4.0
 - One-line online installer (`install.sh`, x-ui style) that downloads the latest release from GitHub; interactive port/protocol questions.
 - `fwpanel` management command with a menu (start/stop/restart/status/log, password, port, HTTP/HTTPS, allow-list, update, uninstall).

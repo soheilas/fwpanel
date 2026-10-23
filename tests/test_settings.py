@@ -109,7 +109,7 @@ try:
     head = data.split(b"__PAYLOAD__")[0].decode()
     check("installer carries the tunnel + port + 64-hex key args",
           "--tunnel tun2" in head and "--port 9443" in head and "--http" in head and re.search(r"--sync-key [0-9a-f]{64}", head)
-          and "--ip 10.0.0.1/30" in head and "--local6 2001:db8::2" in head and "--remote6 2001:db8::1" in head)
+          and "--ip 10.0.0.1/30" in head and "--kind gre6" in head and "--local 2001:db8::2" in head and "--remote 2001:db8::1" in head)
     # the payload must unpack to a complete install tree (same pipeline the installer uses)
     ex = os.path.join(TMP, "ex")
     os.makedirs(ex)
@@ -121,6 +121,26 @@ try:
     check("installer scripts have valid syntax",
           subprocess.run([BASH, "-n", fw(script)]).returncode == 0 and subprocess.run([BASH, "-n", fw(os.path.join(ex, "install.sh"))]).returncode == 0)
     A.call("GET", "/api/links/999/installer", expect=404)
+
+    # ---- GRE4 / GRE6 tunnel kinds
+    t4 = {"enabled": True, "name": "g4", "kind": "gre4", "foreign_ep": "203.0.113.1", "iran_ep": "203.0.113.2", "foreign_ip": "10.8.0.2", "iran_ip": "10.8.0.1"}
+    A.call("POST", "/api/links/new-iran", {**base, "tunnel": {**t4, "foreign_ep": "2001:db8::1"}}, expect=400)       # gre4 needs IPv4 endpoints
+    A.call("POST", "/api/links/new-iran", {**base, "tunnel": {**t4, "iran_ep": "203.0.113.1"}}, expect=400)          # same address on both ends
+    A.call("POST", "/api/links/new-iran", {**base, "tunnel": {**t4, "kind": "gre6"}}, expect=400)                    # gre6 needs IPv6 endpoints
+    l4 = A.call("POST", "/api/links/new-iran", {**base, "name": "G4", "tunnel": t4})["link"]
+    check("gre4 link created (%s)" % l4["tunnel_kind"], l4["tunnel_kind"] == "gre4" and l4["url"] == "http://10.8.0.1:9443")
+    h4 = A.call("GET", f"/api/links/{l4['id']}/installer", raw=True)[0].split(b"__PAYLOAD__")[0].decode()
+    check("gre4 installer args: --kind gre4 --local <iran ep> --remote <foreign ep>",
+          "--kind gre4" in h4 and "--local 203.0.113.2" in h4 and "--remote 203.0.113.1" in h4 and "--ip 10.8.0.1/30" in h4)
+    t6 = {"enabled": True, "name": "g6", "kind": "gre6", "foreign_ep": "2001:db8::1", "iran_ep": "2001:db8::2", "foreign_ip": "10.8.1.2", "iran_ip": "10.8.1.1"}
+    l6 = A.call("POST", "/api/links/new-iran", {**base, "name": "G6", "tunnel": t6})["link"]
+    h6 = A.call("GET", f"/api/links/{l6['id']}/installer", raw=True)[0].split(b"__PAYLOAD__")[0].decode()
+    check("gre6 installer args", "--kind gre6" in h6 and "--local 2001:db8::2" in h6 and "--remote 2001:db8::1" in h6)
+    s4, u4 = m.tunnel_files("g4", "gre4", "203.0.113.2", "203.0.113.1", "10.8.0.1/30")
+    s6, u6 = m.tunnel_files("g6", "gre6", "2001:db8::2", "2001:db8::1", "10.8.1.1/30")
+    check("tunnel script: gre4 uses 'ip tunnel ... mode gre', gre6 uses 'ip -6 tunnel ... ip6gre'",
+          "ip tunnel add $IF mode gre local 203.0.113.2 remote 203.0.113.1" in s4 and "ip -6" not in s4
+          and "ip -6 tunnel add $IF mode ip6gre local 2001:db8::2 remote 2001:db8::1" in s6 and "GRE4" in u4 and "GRE6" in u6)
 
     # ---- local admin CLI (used by fwpanel-setup.sh): no password, token file + loopback only
     cli = lambda *a, inp=None: subprocess.run([sys.executable, os.path.join(ROOT, "src", "fwpanel.py"), "admin", *a], env=env, input=inp,

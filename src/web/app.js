@@ -537,12 +537,24 @@ async function downloadInstaller(l) {
 $("#btnNewIran").onclick = async () => {
   $("#irErr").textContent = "";
   if (!panelSettings) await loadPanelSettings();
-  const dl = $("#v6list");
-  dl.replaceChildren();
-  for (const a of (panelSettings || {}).ipv6 || []) { const o = document.createElement("option"); o.value = a; dl.append(o); }
-  if (!$("#tnF6").value && panelSettings && panelSettings.ipv6.length) $("#tnF6").value = panelSettings.ipv6[0];
+  fillTunnelFields(true);
   $("#iranDlg").showModal();
 };
+
+/* the tunnel endpoints are IPv6 addresses for GRE6 and public IPv4 addresses for GRE4 */
+function fillTunnelFields(reset) {
+  const gre4 = $("#tnKind").value === "gre4";
+  const lists = (panelSettings || {});
+  const cands = gre4 ? (lists.ipv4 ? [lists.ipv4] : []) : (lists.ipv6 || []);
+  const dl = $("#epList");
+  dl.replaceChildren();
+  for (const a of cands) { const o = document.createElement("option"); o.value = a; dl.append(o); }
+  $("#lblFE").firstChild.textContent = gre4 ? "IPv4 عمومی همین سرور (خارج)" : "IPv6 همین سرور (خارج)";
+  $("#lblIE").firstChild.textContent = gre4 ? "IPv4 عمومی سرور ایران" : "IPv6 سرور ایران ";
+  $("#lblIE small").classList.toggle("hidden", gre4);
+  if (reset) { $("#tnFE").value = cands[0] || ""; $("#tnIE").value = gre4 ? $("#irIp").value.trim() : ""; }
+}
+$("#tnKind").onchange = () => fillTunnelFields(true);
 $("#irTun").onchange = () => $("#irTunBox").classList.toggle("hidden", !$("#irTun").checked);
 $("#irCancel").onclick = () => $("#iranDlg").close();
 $("#iranForm").addEventListener("submit", async (ev) => {
@@ -551,7 +563,8 @@ $("#iranForm").addEventListener("submit", async (ev) => {
   const body = {
     name: $("#irName").value.trim(), port: $("#irPort").value.trim(), scheme: $("#irScheme").value,
     iran_ip: $("#irIp").value.trim(), target_ip: $("#irTarget").value.trim(),
-    tunnel: { enabled: $("#irTun").checked, name: $("#tnName").value.trim(), foreign_v6: $("#tnF6").value.trim(), iran_v6: $("#tnI6").value.trim(),
+    tunnel: { enabled: $("#irTun").checked, name: $("#tnName").value.trim(), kind: $("#tnKind").value,
+              foreign_ep: $("#tnFE").value.trim(), iran_ep: $("#tnIE").value.trim(),
               foreign_ip: $("#tnF4").value.trim(), iran_ip: $("#tnI4").value.trim() },
   };
   try {

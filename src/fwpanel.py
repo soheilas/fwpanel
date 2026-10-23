@@ -42,7 +42,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 CONF_DIR = os.environ.get("FWPANEL_DIR", "/etc/fwpanel")
 DRY = os.environ.get("FWPANEL_DRY") == "1"
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -693,7 +693,8 @@ def sync_worker():
 def public_link(l):
     return {"id": l["id"], "name": l["name"], "url": l["url"], "tunnel_ip": l["tunnel_ip"],
             "enabled": l.get("enabled", True), "status": l.get("status"), "installer": bool(l.get("boot")),
-            "tunnel": (l.get("boot") or {}).get("tunnel", {}).get("name", "")}
+            "tunnel": (l.get("boot") or {}).get("tunnel", {}).get("name", ""),
+            "tunnel_kind": (l.get("boot") or {}).get("tunnel", {}).get("kind", "gre6") if (l.get("boot") or {}).get("tunnel") else ""}
 
 
 # ----------------------------------------------------------------- settings --
@@ -818,13 +819,18 @@ def settings_set(data, client_ip):
 TUN_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,14}$")
 
 
-def tunnel_files(name, local6, remote6, ip_cidr):
+def tunnel_files(name, kind, local, remote, ip_cidr):
+    """Systemd-managed tunnel: kind 'gre6' (GRE over IPv6) or 'gre4' (GRE over IPv4)."""
+    if kind == "gre4":
+        add = f"ip tunnel add $IF mode gre local {local} remote {remote} ttl 255 2>/dev/null"
+    else:
+        add = f"ip -6 tunnel add $IF mode ip6gre local {local} remote {remote} ttl 255 encaplimit none 2>/dev/null"
     script = f"""#!/bin/bash
 # managed by fwpanel
 IF={name}
 case "$1" in
 up)
- ip -6 tunnel add $IF mode ip6gre local {local6} remote {remote6} ttl 255 encaplimit none 2>/dev/null
+ {add}
  ip addr add {ip_cidr} dev $IF 2>/dev/null
  ip link set $IF mtu 1440 txqueuelen 10000 up
  ;;
@@ -833,7 +839,7 @@ esac
 exit 0
 """
     unit = f"""[Unit]
-Description=fwpanel GRE6 tunnel {name}
+Description=fwpanel {kind.upper()} tunnel {name}
 After=network-online.target
 Wants=network-online.target
 
@@ -849,10 +855,10 @@ WantedBy=multi-user.target
     return script, unit
 
 
-def create_tunnel_local(name, local6, remote6, ip_cidr):
-    script, unit = tunnel_files(name, local6, remote6, ip_cidr)
+def create_tunnel_local(name, kind, local, remote, ip_cidr):
+    script, unit = tunnel_files(name, kind, local, remote, ip_cidr)
     if DRY:
-        log(f"[dry] create tunnel {name} {local6} -> {remote6} {ip_cidr}")
+        log(f"[dry] create {kind} tunnel {name} {local} -> {remote} {ip_cidr}")
         return
     with open(f"/usr/local/sbin/fwp-tunnel-{name}.sh", "w") as f:
         f.write(script)
@@ -919,7 +925,9 @@ def installer_args(link):
     a = ["--port", str(b["port"]), "--https" if b.get("scheme") == "https" else "--http", "--sync-key", link["secret"]]
     t = b.get("tunnel")
     if t:
-        a += ["--tunnel", t["name"], "--local6", t["iran_v6"], "--remote6", t["foreign_v6"], "--ip", t["iran_ip"] + "/30"]
+        kind = t.get("kind", "gre6")
+        a += ["--tunnel", t["name"], "--kind", kind, "--local", t.get("iran_ep") or t["iran_v6"],
+              "--remote", t.get("foreign_ep") or t["foreign_v6"], "--ip", t["iran_ip"] + "/30"]
     return a
 
 
@@ -1272,14 +1280,19 @@ class Handler(BaseHTTPRequestHandler):
             tname = str(tun.get("name", "")).strip().lower()
             if not TUN_NAME_RE.match(tname):
                 raise ValueError("نام تونل: حروف کوچک انگلیسی/عدد، حداکثر ۱۵ کاراکتر")
+            kind = "gre4" if str(tun.get("kind", "gre6")).lower() == "gre4" else "gre6"
+            cls = ipaddress.IPv4Address if kind == "gre4" else ipaddress.IPv6Address
             try:
-                f6, i6 = str(ipaddress.IPv6Address(str(tun.get("foreign_v6", "")).strip())), str(ipaddress.IPv6Address(str(tun.get("iran_v6", "")).strip()))
+                f_ep = str(cls(str(tun.get("foreign_ep") or tun.get("foreign_v6", "")).strip()))
+                i_ep = str(cls(str(tun.get("iran_ep") or tun.get("iran_v6", "")).strip()))
             except ValueError:
-                raise ValueError("آدرس IPv6 نامعتبر است")
+                raise ValueError("آدرس " + ("IPv4" if kind == "gre4" else "IPv6") + " دو سر تونل نامعتبر است")
+            if f_ep == i_ep:
+                raise ValueError("آدرس دو سر تونل نباید یکی باشد")
             f4, i4 = to_ipv4(tun.get("foreign_ip"), "آی‌پی تونل سمت خارج"), to_ipv4(tun.get("iran_ip"), "آی‌پی تونل سمت ایران")
             if f4 == i4 or ipaddress.ip_address(i4) not in ipaddress.ip_network(f4 + "/30", strict=False):
                 raise ValueError("دو آی‌پی تونل باید متفاوت و داخل یک رنج /30 باشند (مثل 10.20.0.1 و 10.20.0.2)")
-            boot["tunnel"] = {"name": tname, "foreign_v6": f6, "iran_v6": i6, "foreign_ip": f4, "iran_ip": i4}
+            boot["tunnel"] = {"name": tname, "kind": kind, "foreign_ep": f_ep, "iran_ep": i_ep, "foreign_ip": f4, "iran_ip": i4}
             target, url = f4, f"{scheme}://{i4}:{port}"
         else:
             iran_ip = to_ipv4(d.get("iran_ip"), "آی‌پی عمومی سرور ایران")
@@ -1292,7 +1305,7 @@ class Handler(BaseHTTPRequestHandler):
             if tun:
                 try:
                     t = boot["tunnel"]
-                    create_tunnel_local(t["name"], t["foreign_v6"], t["iran_v6"], t["foreign_ip"] + "/30")
+                    create_tunnel_local(t["name"], t["kind"], t["foreign_ep"], t["iran_ep"], t["foreign_ip"] + "/30")
                 except Exception as e:
                     raise ValueError(f"ساخت تونل روی این سرور ناموفق بود: {e}")
             links.append(link)

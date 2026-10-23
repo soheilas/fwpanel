@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
     --update)  UPDATE=1; shift ;;
     --yes|-y)  YES=1; shift ;;
     -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 0 ;;
-    --sync-key|--tunnel|--local6|--remote6|--ip) PASS+=("$1" "${2:-}"); shift 2 ;;
+    --sync-key|--tunnel|--kind|--local|--remote|--local6|--remote6|--ip) PASS+=("$1" "${2:-}"); shift 2 ;;
     --replace-key) PASS+=("$1"); shift ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac

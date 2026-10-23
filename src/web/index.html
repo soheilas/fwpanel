@@ -166,13 +166,15 @@
       <label class="span2">آی‌پی مقصد فوروارد روی این سرور <small class="muted">(خالی = آی‌پی اصلی همین سرور)</small>
         <input id="irTarget" dir="ltr" placeholder="1.2.3.4"></label>
     </div>
-    <label class="check"><input type="checkbox" id="irTun"><span>همزمان تونل GRE6 هم بین دو سرور ساخته شود</span></label>
+    <label class="check"><input type="checkbox" id="irTun"><span>همزمان تونل GRE هم بین دو سرور ساخته شود</span></label>
     <div id="irTunBox" class="grid hidden" style="margin-top:10px">
       <label>نام تونل<input id="tnName" dir="ltr" value="tun1" maxlength="15"></label>
-      <div></div>
-      <label class="span2">IPv6 همین سرور (خارج)<input id="tnF6" dir="ltr" list="v6list"></label>
-      <datalist id="v6list"></datalist>
-      <label class="span2">IPv6 سرور ایران <small class="muted">(آدرس ثابت، نه آدرس خودکار ff:fe)</small><input id="tnI6" dir="ltr"></label>
+      <label>نوع تونل
+        <select id="tnKind"><option value="gre6">GRE6 (روی IPv6)</option><option value="gre4">GRE4 (روی IPv4)</option></select>
+      </label>
+      <label class="span2" id="lblFE">IPv6 همین سرور (خارج)<input id="tnFE" dir="ltr" list="epList"></label>
+      <datalist id="epList"></datalist>
+      <label class="span2" id="lblIE">IPv6 سرور ایران <small class="muted">(آدرس ثابت، نه آدرس خودکار ff:fe)</small><input id="tnIE" dir="ltr"></label>
       <label>آی‌پی تونل سمت خارج<input id="tnF4" dir="ltr" value="192.168.70.2"></label>
       <label>آی‌پی تونل سمت ایران<input id="tnI4" dir="ltr" value="192.168.70.1"></label>
     </div>

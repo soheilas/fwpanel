@@ -8,13 +8,14 @@
 #   --http | --https    serve the panel over plain HTTP or HTTPS (self-signed). Default: https
 #   --sync-key HEX      64-hex key this panel accepts forwarding rules from (used by generated Iran installers)
 #   --replace-key       allow --sync-key to replace a key that is already set (the panel that used the old key stops syncing)
-#   --tunnel NAME --local6 ADDR --remote6 ADDR --ip A.B.C.D/30
-#                       also create a persistent GRE6 tunnel (this server = local6, peer = remote6)
+#   --tunnel NAME [--kind gre6|gre4] --local ADDR --remote ADDR --ip A.B.C.D/30
+#                       also create a persistent GRE tunnel: gre6 (default, IPv6 addresses) or gre4 (public IPv4 addresses);
+#                       this server = local, the peer = remote, --ip = this side's tunnel address
 #   --uninstall         remove the panel (config and password are kept)
 #   --purge             with --uninstall: also delete /etc/fwpanel
 set -euo pipefail
 
-PORT=""; MODE=""; REPLACE_KEY=0; SYNC_KEY=""; TUN=""; LOCAL6=""; REMOTE6=""; TUNIP=""; UNINSTALL=0; PURGE=0
+PORT=""; MODE=""; REPLACE_KEY=0; SYNC_KEY=""; TUN=""; KIND="gre6"; LOCAL6=""; REMOTE6=""; TUNIP=""; UNINSTALL=0; PURGE=0
 # FWPANEL_PREFIX=/some/dir runs a file-only dry install (no apt, no systemd, no tunnel) - used by the tests
 PREFIX="${FWPANEL_PREFIX:-}"
 DIR="$PREFIX/opt/fwpanel"
@@ -32,8 +33,9 @@ while [ $# -gt 0 ]; do
     --sync-key)  SYNC_KEY="${2:-}"; shift 2 ;;
     --replace-key) REPLACE_KEY=1; shift ;;
     --tunnel)    TUN="${2:-}"; shift 2 ;;
-    --local6)    LOCAL6="${2:-}"; shift 2 ;;
-    --remote6)   REMOTE6="${2:-}"; shift 2 ;;
+    --kind)      KIND="${2:-}"; shift 2 ;;
+    --local|--local6)   LOCAL6="${2:-}"; shift 2 ;;
+    --remote|--remote6) REMOTE6="${2:-}"; shift 2 ;;
     --ip)        TUNIP="${2:-}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge)     PURGE=1; shift ;;
@@ -55,7 +57,8 @@ fi
 [ -z "$SYNC_KEY" ] || [[ "$SYNC_KEY" =~ ^[0-9a-fA-F]{64}$ ]] || die "--sync-key must be 64 hex characters"
 if [ -n "$TUN$LOCAL6$REMOTE6$TUNIP" ]; then
   [[ "$TUN" =~ ^[a-z][a-z0-9_-]{0,14}$ ]] || die "bad --tunnel name"
-  [ -n "$LOCAL6" ] && [ -n "$REMOTE6" ] && [[ "$TUNIP" =~ ^[0-9.]+/[0-9]+$ ]] || die "--tunnel needs --local6, --remote6 and --ip A.B.C.D/30"
+  [ "$KIND" = gre6 ] || [ "$KIND" = gre4 ] || die "--kind must be gre6 or gre4"
+  [ -n "$LOCAL6" ] && [ -n "$REMOTE6" ] && [[ "$TUNIP" =~ ^[0-9.]+/[0-9]+$ ]] || die "--tunnel needs --local, --remote and --ip A.B.C.D/30"
 fi
 
 need() { command -v "$1" >/dev/null 2>&1; }
@@ -102,7 +105,7 @@ if [ -n "$TUN" ] && [ -z "$PREFIX" ]; then
 IF=$TUN
 case "\$1" in
 up)
- ip -6 tunnel add \$IF mode ip6gre local $LOCAL6 remote $REMOTE6 ttl 255 encaplimit none 2>/dev/null
+ $([ "$KIND" = gre4 ] && echo "ip tunnel add \$IF mode gre local $LOCAL6 remote $REMOTE6 ttl 255" || echo "ip -6 tunnel add \$IF mode ip6gre local $LOCAL6 remote $REMOTE6 ttl 255 encaplimit none") 2>/dev/null
  ip addr add $TUNIP dev \$IF 2>/dev/null
  ip link set \$IF mtu 1440 txqueuelen 10000 up
  ;;
@@ -113,7 +116,7 @@ EOF
   chmod 755 "/usr/local/sbin/fwp-tunnel-$TUN.sh"
   cat > "/etc/systemd/system/fwp-tunnel-$TUN.service" <<EOF
 [Unit]
-Description=fwpanel GRE6 tunnel $TUN
+Description=fwpanel ${KIND^^} tunnel $TUN
 After=network-online.target
 Wants=network-online.target
 
@@ -174,9 +177,12 @@ else
 fi
 if [ -n "$TUN" ]; then
   echo
-  echo "tunnel '$TUN' created: $TUNIP  ($LOCAL6 -> $REMOTE6)"
-  if ping -6 -c 2 -W 2 -I "$LOCAL6" "$REMOTE6" >/dev/null 2>&1; then
-    echo "  IPv6 path to the peer: OK"
+  echo "tunnel '$TUN' ($KIND) created: $TUNIP  ($LOCAL6 -> $REMOTE6)"
+  PV=-6; [ "$KIND" = gre4 ] && PV=-4
+  if ping $PV -c 2 -W 2 -I "$LOCAL6" "$REMOTE6" >/dev/null 2>&1; then
+    echo "  path to the peer ($KIND outer addresses): OK"
+  elif [ "$KIND" = gre4 ]; then
+    echo "  WARNING: no reply from $REMOTE6. ICMP may be filtered, or the peer is not set up yet. GRE (IP protocol 47) must be allowed between the two servers."
   else
     echo "  WARNING: no IPv6 reply from $REMOTE6 using source $LOCAL6."
     echo "  Data centers often block auto-generated (SLAAC, ...ff:fe...) addresses: try the server's other global IPv6 address."

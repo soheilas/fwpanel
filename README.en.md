@@ -3,7 +3,7 @@
 # fwpanel
 
 **A tiny web panel for iptables port forwarding**
-TCP / UDP · live traffic · GRE6 tunnels · automatic multi-server sync
+TCP / UDP · live traffic · GRE4 and GRE6 tunnels · automatic multi-server sync
 
 English · [فارسی](README.md)
 
@@ -29,7 +29,7 @@ Afterwards the `fwpanel` command manages it.
 - Port forwards (DNAT) for TCP, UDP or both; NAT toggle; enable/disable; persistent across reboots
 - Live speed and **persistent totals** (survive restarts/reboots) per forward and per network interface, with reset buttons
 - **Multi-server sync:** a forward created on the foreign server is created on your Iran servers automatically
-- Persistent GRE6 tunnels with automatic discovery of a working IPv6 pair
+- Persistent **GRE6** (over IPv6) or **GRE4** (over IPv4) tunnels, with automatic discovery of a working IPv6 pair
 - IP allow-list, login rate limit, optional HTTPS, HMAC-signed sync requests
 - One dependency-free Python file, about 15 MB of RAM. The UI is Persian (RTL).
 
@@ -60,7 +60,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/soheilas/fwpanel/main/scripts/
 
 Installs the panel on both servers, finds a working IPv6 pair, creates the tunnel, links the panels and creates your first forwards.
 Runs on any Linux / WSL / Git Bash with root SSH access to the servers (files are pushed over SSH: the servers do not need GitHub access).
-Repeat `--iran` for more servers, `--foreign local` to run it on the foreign server, `--no-tunnel` for a direct connection,
+Repeat `--iran` for more servers, `--foreign local` to run it on the foreign server, `--tunnel-type auto|gre6|gre4` (default `auto`: GRE6 if a working IPv6 pair exists, otherwise GRE4; IP protocol 47 must be allowed),
+`--no-tunnel` for a direct connection,
 `--replace-key` to take over an Iran server that already syncs from another panel. After that, create forwards **only in the foreign panel**.
 
 For servers without GitHub access, the foreign panel can generate a self-contained installer for the Iran side
