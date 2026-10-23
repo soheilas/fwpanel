@@ -1,0 +1,18 @@
+fwpanel License (source-available)
+
+Copyright (c) 2026 Soheil. All rights reserved.
+
+Permission is granted to download, install and use this software, free of charge, on servers
+that you own or administer, for any purpose.
+
+Without prior written permission of the copyright holder you may NOT:
+  - redistribute or republish the software or any part of it, modified or not;
+  - sell it, sublicense it, or include it in a product or service that you offer to third parties
+    (including hosted or managed offerings);
+  - remove or alter this license or the copyright notice.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. THE AUTHOR IS NOT LIABLE FOR ANY
+DAMAGES ARISING FROM ITS USE.
+
+Third-party components keep their own licenses:
+  - Vazirmatn font (src/web/fonts/Vazirmatn.woff2): SIL Open Font License 1.1, see src/web/fonts/OFL.txt

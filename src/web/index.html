@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>پنل فوروارد پورت</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<section id="login" class="login hidden">
+  <form class="login-card" id="loginForm" autocomplete="on">
+    <div class="logo big" aria-hidden="true">⇄</div>
+    <h1>پنل فوروارد پورت</h1>
+    <p class="muted">برای ورود، رمز عبور را وارد کن</p>
+    <div class="field">
+      <input type="password" id="loginPw" placeholder="رمز عبور" autocomplete="current-password" required autofocus>
+    </div>
+    <button class="btn primary block lg" type="submit">ورود</button>
+    <p class="error" id="loginErr"></p>
+  </form>
+</section>
+
+<main id="app" class="hidden">
+  <header class="top">
+    <div class="brand"><span class="logo sm" aria-hidden="true">⇄</span><h1>فوروارد پورت</h1></div>
+    <div class="chips" id="chips"></div>
+    <div class="actions">
+      <button class="btn primary" id="btnAdd">+ قانون جدید</button>
+      <button class="btn" id="btnApply" title="اعمال دوباره‌ی همه‌ی قوانین روی iptables">اعمال مجدد</button>
+      <button class="btn" id="btnSettings">تنظیمات</button>
+    </div>
+  </header>
+
+  <section class="card live" id="live">
+    <div class="live-title">ترافیک کارت‌های شبکه</div>
+    <div id="hero"></div>
+    <svg id="spark" viewBox="0 0 300 56" preserveAspectRatio="none" aria-hidden="true">
+      <polyline id="sparkRx" class="l-dn" points=""/>
+      <polyline id="sparkTx" class="l-up" points=""/>
+    </svg>
+    <div class="ifgrid" id="ifgrid"></div>
+  </section>
+
+  <div class="card list" id="list" aria-live="polite"></div>
+  <p class="foot muted">قوانین و مجموع ترافیک دائمی‌اند و بعد از ریستارت و ریبوت از بین نمی‌روند • IPv4 • TCP / UDP</p>
+</main>
+
+<dialog id="ruleDlg">
+  <form method="dialog" id="ruleForm" class="dlg">
+    <h2 id="ruleTitle">قانون جدید</h2>
+    <div class="grid">
+      <label>پروتکل
+        <select id="fProto">
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+          <option value="both">TCP + UDP</option>
+        </select>
+      </label>
+      <label>پورت ورودی
+        <input id="fLport" inputmode="numeric" placeholder="443" required>
+      </label>
+      <label class="span2">آی‌پی مقصد
+        <input id="fDip" dir="ltr" inputmode="decimal" placeholder="1.2.3.4" required>
+      </label>
+      <label>پورت مقصد
+        <input id="fDport" inputmode="numeric" placeholder="مثل پورت ورودی">
+      </label>
+      <label>آی‌پی ورودی <small class="muted">(اختیاری)</small>
+        <input id="fLip" dir="ltr" inputmode="decimal" placeholder="همه‌ی آی‌پی‌ها">
+      </label>
+      <label class="span2">توضیح <small class="muted">(اختیاری)</small>
+        <input id="fComment" maxlength="80" placeholder="مثلاً آلمان ۱">
+      </label>
+    </div>
+    <label class="check"><input type="checkbox" id="fMasq" checked>
+      <span>NAT (MASQUERADE) — برای بیشتر موارد روشن بماند</span></label>
+    <label class="check"><input type="checkbox" id="fEnabled" checked><span>فعال</span></label>
+    <label class="check hidden" id="syncRow"><input type="checkbox" id="fSync" checked>
+      <span>ارسال خودکار به سرورهای ایران (همگام‌سازی)</span></label>
+    <p class="error" id="ruleErr"></p>
+    <div class="dlg-actions">
+      <button class="btn primary" id="ruleSave" type="submit" value="save">ذخیره</button>
+      <button class="btn" type="button" id="ruleCancel">انصراف</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="setDlg">
+  <div class="dlg">
+    <h2>تنظیمات</h2>
+    <h3>پنل</h3>
+    <form id="panelForm" class="grid">
+      <label>پورت پنل<input id="spPort" inputmode="numeric" required></label>
+      <label>پروتکل
+        <select id="spTls"><option value="http">HTTP (بدون رمزنگاری)</option><option value="https">HTTPS (گواهی self-signed)</option></select>
+      </label>
+      <label class="span2">آی‌پی‌های مجاز برای ورود به پنل <small class="muted">(هر خط یک آی‌پی یا رنج؛ خالی = همه)</small>
+        <textarea id="spAllow" dir="ltr" rows="3" placeholder="1.2.3.4&#10;5.6.7.0/24"></textarea>
+      </label>
+      <div class="span2 hint muted" id="spHint"></div>
+      <div class="span2"><button class="btn primary" type="submit">ذخیره تنظیمات پنل</button></div>
+    </form>
+    <h3>همگام‌سازی با پنل‌های ایران <small class="muted">(ارسال)</small></h3>
+    <p class="muted small">هر قانونی که اینجا بسازی، روی سرور ایران لینک‌شده خودکار به «آی‌پی تونل» فوروارد می‌شود.</p>
+    <div id="linkList" class="links"></div>
+    <div class="row"><button class="btn primary" id="btnNewIran" type="button">+ افزودن سرور ایران جدید (با اسکریپت نصب)</button></div>
+    <h3>اتصال به پنل ایرانِ از قبل نصب‌شده</h3>
+    <form id="linkForm" class="grid">
+      <label>نام سرور<input id="lkName" maxlength="30" placeholder="Mobin One" required></label>
+      <label>آی‌پی تونل (سمت همین سرور)<input id="lkTun" dir="ltr" placeholder="192.168.60.2" required></label>
+      <label class="span2">آدرس پنل ایران<input id="lkUrl" dir="ltr" placeholder="http://1.2.3.4:9443" required></label>
+      <label class="span2">کلید همگام‌سازی (از پنل ایران بگیر)<input id="lkKey" dir="ltr" autocomplete="off" required></label>
+      <div class="span2"><button class="btn" type="submit">افزودن سرور ایران</button></div>
+    </form>
+    <h3>دریافت همگام‌سازی <small class="muted">(روی سرور ایران)</small></h3>
+    <p class="muted small" id="recvState"></p>
+    <div class="row">
+      <button class="btn" id="btnGenKey" type="button">تولید کلید جدید</button>
+      <button class="btn danger" id="btnOffKey" type="button">غیرفعال‌سازی دریافت</button>
+    </div>
+    <div class="keybox hidden" id="keyBox"><code id="keyOut" dir="ltr"></code><button class="btn icon" id="btnCopyKey" type="button">کپی</button></div>
+    <h3>پشتیبان</h3>
+    <div class="row">
+      <button class="btn" id="btnExport">دانلود پشتیبان</button>
+      <button class="btn" id="btnImport">بازگردانی از فایل</button>
+      <input type="file" id="fileImport" accept="application/json,.json" class="hidden">
+    </div>
+    <h3>تغییر رمز عبور</h3>
+    <form id="pwForm" class="grid">
+      <label class="span2">رمز فعلی<input type="password" id="pwOld" autocomplete="current-password" required></label>
+      <label class="span2">رمز جدید (حداقل ۸ کاراکتر)<input type="password" id="pwNew" autocomplete="new-password" minlength="8" required></label>
+      <div class="span2"><button class="btn" type="submit">تغییر رمز</button></div>
+    </form>
+    <p class="error" id="setErr"></p>
+    <div class="dlg-actions">
+      <button class="btn danger" id="btnLogout">خروج</button>
+      <button class="btn" id="setClose">بستن</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="delDlg">
+  <div class="dlg">
+    <h2>حذف قانون</h2>
+    <p id="delText"></p>
+    <div class="dlg-actions">
+      <button class="btn danger" id="delOk">حذف</button>
+      <button class="btn" id="delCancel">انصراف</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="iranDlg">
+  <form method="dialog" class="dlg" id="iranForm">
+    <h2>افزودن سرور ایران جدید</h2>
+    <p class="muted small">یک اسکریپت نصب برای سرور ایران ساخته می‌شود. آن را روی سرور ایران اجرا کن؛ پنل نصب می‌شود و خودکار قانون‌ها را از این پنل می‌گیرد.</p>
+    <div class="grid">
+      <label>نام سرور<input id="irName" maxlength="30" placeholder="Iran-1" required></label>
+      <label>پورت پنل روی ایران<input id="irPort" inputmode="numeric" value="9443" required></label>
+      <label>پروتکل پنل ایران
+        <select id="irScheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select>
+      </label>
+      <label>آی‌پی عمومی سرور ایران<input id="irIp" dir="ltr" placeholder="1.2.3.4" required></label>
+      <label class="span2">آی‌پی مقصد فوروارد روی این سرور <small class="muted">(خالی = آی‌پی اصلی همین سرور)</small>
+        <input id="irTarget" dir="ltr" placeholder="1.2.3.4"></label>
+    </div>
+    <label class="check"><input type="checkbox" id="irTun"><span>همزمان تونل GRE6 هم بین دو سرور ساخته شود</span></label>
+    <div id="irTunBox" class="grid hidden" style="margin-top:10px">
+      <label>نام تونل<input id="tnName" dir="ltr" value="tun1" maxlength="15"></label>
+      <div></div>
+      <label class="span2">IPv6 همین سرور (خارج)<input id="tnF6" dir="ltr" list="v6list"></label>
+      <datalist id="v6list"></datalist>
+      <label class="span2">IPv6 سرور ایران <small class="muted">(آدرس ثابت، نه آدرس خودکار ff:fe)</small><input id="tnI6" dir="ltr"></label>
+      <label>آی‌پی تونل سمت خارج<input id="tnF4" dir="ltr" value="192.168.70.2"></label>
+      <label>آی‌پی تونل سمت ایران<input id="tnI4" dir="ltr" value="192.168.70.1"></label>
+    </div>
+    <p class="error" id="irErr"></p>
+    <div class="dlg-actions">
+      <button class="btn primary" type="submit">ساخت و دانلود اسکریپت</button>
+      <button class="btn" type="button" id="irCancel">انصراف</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="nameDlg">
+  <form method="dialog" class="dlg" id="nameForm">
+    <h2>نام نمایشی تانل</h2>
+    <p class="muted small" id="nameReal"></p>
+    <label class="grid-one">نام دلخواه (خالی = نام اصلی)
+      <input id="nameInput" maxlength="24" placeholder="مثلاً Mobin One">
+    </label>
+    <div class="dlg-actions">
+      <button class="btn primary" type="submit">ذخیره</button>
+      <button class="btn" type="button" id="nameCancel">انصراف</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" role="status"></div>
+<script src="/app.js"></script>
+</body>
+</html>
