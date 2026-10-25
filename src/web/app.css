@@ -196,3 +196,50 @@ textarea { width: 100%; padding: 10px 13px; font: inherit; color: var(--text); b
   border-radius: 12px; outline: none; resize: vertical; margin-top: 5px; display: block; }
 .hint { font-size: 12.5px; }
 .lk-acts .btn.icon { white-space: nowrap; }
+
+/* tunnels */
+.tunnels { padding: 16px 18px 18px; margin-bottom: 16px; }
+.sec-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.sec-head h2 { font-size: 16px; }
+.sec-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.tungrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px; }
+.tun { border: 1px solid var(--line); border-radius: 16px; padding: 14px; display: grid; gap: 8px; position: relative; }
+.tun .top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tun .top b { font-size: 15.5px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); display: inline-block; flex: none; }
+.tun.healthy .dot { background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 20%, transparent); }
+.tun.degraded .dot { background: var(--warn); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 22%, transparent); }
+.tun.down .dot { background: var(--danger); box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 20%, transparent); }
+.tun.busy .dot { background: var(--primary); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+.kbadge { font-size: 11.5px; font-weight: 700; padding: 1px 8px; border-radius: 7px; background: var(--chip); color: var(--muted); }
+.kbadge.k { color: var(--both); }
+.tun .ep, .tun .inner { font-size: 12.5px; color: var(--muted); direction: ltr; text-align: left; unicode-bidi: plaintext; word-break: break-all; }
+.tun .health { font-size: 13.5px; min-height: 1.6em; }
+.tun .health .bad { color: var(--danger); } .tun .health .good { color: var(--ok); } .tun .health .mid { color: var(--warn); }
+.tun .btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.tun .steps { border-top: 1px dashed var(--line); padding-top: 8px; display: grid; gap: 3px; font-size: 12.5px; }
+.tun .steps .s.ok { color: var(--ok); } .tun .steps .s.no { color: var(--warn); } .tun .steps .s.fx { color: var(--primary); }
+
+/* wizard */
+.dlg.wide { width: 100%; }
+dialog:has(.dlg.wide) { width: min(620px, calc(100vw - 24px)); }
+.seg { display: grid; grid-template-columns: 1fr 1fr; background: var(--chip); border-radius: 12px; padding: 4px; gap: 4px; margin-bottom: 14px; }
+.seg button { border: 0; background: transparent; color: var(--muted); font: inherit; padding: 8px; border-radius: 9px; cursor: pointer; }
+.seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.18); font-weight: 650; }
+.warnbox { background: color-mix(in srgb, var(--warn) 14%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  color: var(--text); padding: 9px 12px; border-radius: 12px; font-size: 13px; margin-bottom: 12px; }
+.prog { display: grid; gap: 6px; max-height: 46vh; overflow: auto; padding: 4px 2px; }
+.step { display: flex; gap: 9px; align-items: flex-start; font-size: 14px; line-height: 1.6; }
+.step i { font-style: normal; width: 18px; flex: none; text-align: center; font-weight: 700; }
+.step.ok i { color: var(--ok); } .step.warn i { color: var(--warn); } .step.err i { color: var(--danger); } .step.info i { color: var(--muted); }
+.step.err span { color: var(--danger); }
+.step.live i { animation: pulse 1s infinite; color: var(--primary); }
+.result { margin-top: 12px; border: 1px solid color-mix(in srgb, var(--ok) 50%, var(--line)); background: color-mix(in srgb, var(--ok) 8%, transparent);
+  border-radius: 14px; padding: 12px 14px; display: grid; gap: 6px; font-size: 14px; }
+.result .row2 { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.result .row2 span:first-child { color: var(--muted); }
+.result code { direction: ltr; unicode-bidi: isolate; user-select: all; font-size: 13px; }
+.lk-st.ok b, .tag.ok { color: var(--ok); }
+
+.mt10 { margin-top: 10px; }

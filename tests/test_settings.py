@@ -106,7 +106,7 @@ try:
     check("installer is a download", "attachment" in hdrs.get("Content-Disposition", "") and data.startswith(b"#!/usr/bin/env bash"))
     script = os.path.join(TMP, "install-test.sh")
     open(script, "wb").write(data)
-    head = data.split(b"__PAYLOAD__")[0].decode()
+    head = data.split(b"<<'__FWPANEL_PAYLOAD__'")[0].decode()
     check("installer carries the tunnel + port + 64-hex key args",
           "--tunnel tun2" in head and "--port 9443" in head and "--http" in head and re.search(r"--sync-key [0-9a-f]{64}", head)
           and "--ip 10.0.0.1/30" in head and "--kind gre6" in head and "--local 2001:db8::2" in head and "--remote 2001:db8::1" in head)
@@ -114,9 +114,13 @@ try:
     ex = os.path.join(TMP, "ex")
     os.makedirs(ex)
     fw = lambda x: x.replace(chr(92), "/")
-    rc = subprocess.run([BASH, "-c", "awk '/^__PAYLOAD__$/ {p=1; next} p' \"" + fw(script) + "\" | base64 -d | tar -xz -C \"" + fw(ex) + "\""],
-                        capture_output=True, text=True)
-    files = {os.path.relpath(os.path.join(d, f), ex).replace("\\", "/") for d, _, fs in os.walk(ex) for f in fs}
+    import base64, io, tarfile
+    txt = data.decode()
+    m0 = re.search(r"<<'__FWPANEL_PAYLOAD__'[^\n]*\n(.*?)\n__FWPANEL_PAYLOAD__\n", txt, re.S)
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(m0.group(1))), mode="r:gz") as tf:
+        tf.extractall(ex)
+    rc = subprocess.CompletedProcess([], 0)
+    files = {os.path.relpath(os.path.join(d, f), ex).replace(chr(92), "/") for d, _, fs in os.walk(ex) for f in fs}
     check("payload unpacks (%d files)" % len(files), rc.returncode == 0 and {"fwpanel.py", "install.sh", "uninstall.sh", "fwpanel.sh", "web/index.html", "web/app.js", "web/app.css"} <= files)
     check("installer scripts have valid syntax",
           subprocess.run([BASH, "-n", fw(script)]).returncode == 0 and subprocess.run([BASH, "-n", fw(os.path.join(ex, "install.sh"))]).returncode == 0)
@@ -129,12 +133,12 @@ try:
     A.call("POST", "/api/links/new-iran", {**base, "tunnel": {**t4, "kind": "gre6"}}, expect=400)                    # gre6 needs IPv6 endpoints
     l4 = A.call("POST", "/api/links/new-iran", {**base, "name": "G4", "tunnel": t4})["link"]
     check("gre4 link created (%s)" % l4["tunnel_kind"], l4["tunnel_kind"] == "gre4" and l4["url"] == "http://10.8.0.1:9443")
-    h4 = A.call("GET", f"/api/links/{l4['id']}/installer", raw=True)[0].split(b"__PAYLOAD__")[0].decode()
+    h4 = A.call("GET", f"/api/links/{l4['id']}/installer", raw=True)[0].split(b"<<'__FWPANEL_PAYLOAD__'")[0].decode()
     check("gre4 installer args: --kind gre4 --local <iran ep> --remote <foreign ep>",
           "--kind gre4" in h4 and "--local 203.0.113.2" in h4 and "--remote 203.0.113.1" in h4 and "--ip 10.8.0.1/30" in h4)
     t6 = {"enabled": True, "name": "g6", "kind": "gre6", "foreign_ep": "2001:db8::1", "iran_ep": "2001:db8::2", "foreign_ip": "10.8.1.2", "iran_ip": "10.8.1.1"}
     l6 = A.call("POST", "/api/links/new-iran", {**base, "name": "G6", "tunnel": t6})["link"]
-    h6 = A.call("GET", f"/api/links/{l6['id']}/installer", raw=True)[0].split(b"__PAYLOAD__")[0].decode()
+    h6 = A.call("GET", f"/api/links/{l6['id']}/installer", raw=True)[0].split(b"<<'__FWPANEL_PAYLOAD__'")[0].decode()
     check("gre6 installer args", "--kind gre6" in h6 and "--local 2001:db8::2" in h6 and "--remote 2001:db8::1" in h6)
     s4, u4 = m.tunnel_files("g4", "gre4", "203.0.113.2", "203.0.113.1", "10.8.0.1/30")
     s6, u6 = m.tunnel_files("g6", "gre6", "2001:db8::2", "2001:db8::1", "10.8.1.1/30")
@@ -142,7 +146,7 @@ try:
           "ip tunnel add $IF mode gre local 203.0.113.2 remote 203.0.113.1" in s4 and "ip -6" not in s4
           and "ip -6 tunnel add $IF mode ip6gre local 2001:db8::2 remote 2001:db8::1" in s6 and "GRE4" in u4 and "GRE6" in u6)
 
-    # ---- local admin CLI (used by fwpanel-setup.sh): no password, token file + loopback only
+    # ---- local admin CLI (used by the installer and menu): no password, token file + loopback only
     cli = lambda *a, inp=None: subprocess.run([sys.executable, os.path.join(ROOT, "src", "fwpanel.py"), "admin", *a], env=env, input=inp,
                                               capture_output=True)
     r = cli("GET", "/api/settings")

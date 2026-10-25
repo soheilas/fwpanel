@@ -9,6 +9,8 @@
 #   --http | --https   panel protocol (default: http)
 #   --update           update an existing install, keep its settings
 #   --yes              never ask questions (fresh install: random port, http)
+#   --iran HOST        after installing, set up this Iran server too (asks for its root password)
+#   --no-iran          do not offer to set up an Iran server
 # The options of the local installer (--sync-key, --replace-key, --tunnel ...) are passed through.
 set -uo pipefail
 
@@ -19,7 +21,7 @@ info() { printf "${cyan}==>${plain} %s\n" "$*"; }
 warn() { printf "${yellow}%s${plain}\n" "$*"; }
 die()  { printf "${red}error: %s${plain}\n" "$*" >&2; exit 1; }
 
-VERSION=""; PORT=""; MODE=""; UPDATE=0; YES=0; PASS=()
+VERSION=""; PORT=""; MODE=""; UPDATE=0; YES=0; NOIRAN=0; IRAN=(); PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="${2:-}"; shift 2 ;;
@@ -28,7 +30,9 @@ while [ $# -gt 0 ]; do
     --https)   MODE=https; shift ;;
     --update)  UPDATE=1; shift ;;
     --yes|-y)  YES=1; shift ;;
-    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --iran)    IRAN+=("${2:-}"); shift 2 ;;
+    --no-iran) NOIRAN=1; shift ;;
+    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}"; exit 0 ;;
     --sync-key|--tunnel|--kind|--local|--remote|--local6|--remote6|--ip) PASS+=("$1" "${2:-}"); shift 2 ;;
     --replace-key) PASS+=("$1"); shift ;;
     *) die "unknown option: $1 (try --help)" ;;
@@ -129,7 +133,22 @@ echo "------------------------------------------------------------"
 echo "  fwpanel               - open the management menu"
 echo "  fwpanel status|log    - state and logs"
 echo "  fwpanel port|password - change the port / the password"
+echo "  fwpanel add-iran      - set up an Iran server (SSH or one-line command)"
 echo "  fwpanel update        - update to the latest release"
 echo "  fwpanel uninstall     - remove it"
 echo "------------------------------------------------------------"
+
+# ---- offer to set up the Iran side right now (installs the panel there, builds + optimises the tunnel, links sync)
+PYA="python3 /opt/fwpanel/fwpanel.py"
+for h in "${IRAN[@]}"; do $PYA add-iran --host "$h"; done
+if [ ${#IRAN[@]} -eq 0 ] && [ "$NOIRAN" = 0 ] && [ "$YES" = 0 ] && [ -t 0 ]; then
+  while true; do
+    echo
+    read -r -p "Set up an Iran server now (panel + optimised tunnel + rule sync)? [y/N] " a
+    [[ "$a" =~ ^[Yy] ]] || break
+    $PYA add-iran
+  done
+  echo
+  echo "  You can add Iran servers later with:  fwpanel add-iran   (or the 'Add Iran server' button in the panel)"
+fi
 exit 0

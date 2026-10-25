@@ -28,6 +28,7 @@
     <div class="chips" id="chips"></div>
     <div class="actions">
       <button class="btn primary" id="btnAdd">+ قانون جدید</button>
+      <button class="btn" id="btnTopIran">+ سرور ایران</button>
       <button class="btn" id="btnApply" title="اعمال دوباره‌ی همه‌ی قوانین روی iptables">اعمال مجدد</button>
       <button class="btn" id="btnSettings">تنظیمات</button>
     </div>
@@ -41,6 +42,17 @@
       <polyline id="sparkTx" class="l-up" points=""/>
     </svg>
     <div class="ifgrid" id="ifgrid"></div>
+  </section>
+
+  <section class="card tunnels hidden" id="tunnelsCard">
+    <div class="sec-head">
+      <h2>تونل‌ها</h2>
+      <div class="sec-actions">
+        <button class="btn icon" id="btnTune" type="button" title="BBR، بافرهای شبکه، rp_filter و ip_forward">بهینه‌سازی شبکه‌ی سرور</button>
+        <button class="btn icon" id="btnTunRefresh" type="button">تست دوباره‌ی همه</button>
+      </div>
+    </div>
+    <div class="tungrid" id="tunGrid"></div>
   </section>
 
   <div class="card list" id="list" aria-live="polite"></div>
@@ -153,37 +165,81 @@
 </dialog>
 
 <dialog id="iranDlg">
-  <form method="dialog" class="dlg" id="iranForm">
-    <h2>افزودن سرور ایران جدید</h2>
-    <p class="muted small">یک اسکریپت نصب برای سرور ایران ساخته می‌شود. آن را روی سرور ایران اجرا کن؛ پنل نصب می‌شود و خودکار قانون‌ها را از این پنل می‌گیرد.</p>
-    <div class="grid">
-      <label>نام سرور<input id="irName" maxlength="30" placeholder="Iran-1" required></label>
-      <label>پورت پنل روی ایران<input id="irPort" inputmode="numeric" value="9443" required></label>
-      <label>پروتکل پنل ایران
-        <select id="irScheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select>
-      </label>
-      <label>آی‌پی عمومی سرور ایران<input id="irIp" dir="ltr" placeholder="1.2.3.4" required></label>
-      <label class="span2">آی‌پی مقصد فوروارد روی این سرور <small class="muted">(خالی = آی‌پی اصلی همین سرور)</small>
-        <input id="irTarget" dir="ltr" placeholder="1.2.3.4"></label>
+  <div class="dlg wide">
+    <h2>افزودن سرور ایران</h2>
+    <div class="seg" id="irTabs">
+      <button type="button" class="on" data-m="auto">نصب خودکار (SSH)</button>
+      <button type="button" data-m="cmd">نصب با یک دستور</button>
     </div>
-    <label class="check"><input type="checkbox" id="irTun"><span>همزمان تونل GRE هم بین دو سرور ساخته شود</span></label>
-    <div id="irTunBox" class="grid hidden" style="margin-top:10px">
-      <label>نام تونل<input id="tnName" dir="ltr" value="tun1" maxlength="15"></label>
-      <label>نوع تونل
-        <select id="tnKind"><option value="gre6">GRE6 (روی IPv6)</option><option value="gre4">GRE4 (روی IPv4)</option></select>
-      </label>
-      <label class="span2" id="lblFE">IPv6 همین سرور (خارج)<input id="tnFE" dir="ltr" list="epList"></label>
-      <datalist id="epList"></datalist>
-      <label class="span2" id="lblIE">IPv6 سرور ایران <small class="muted">(آدرس ثابت، نه آدرس خودکار ff:fe)</small><input id="tnIE" dir="ltr"></label>
-      <label>آی‌پی تونل سمت خارج<input id="tnF4" dir="ltr" value="192.168.70.2"></label>
-      <label>آی‌پی تونل سمت ایران<input id="tnI4" dir="ltr" value="192.168.70.1"></label>
+
+    <form id="irAuto">
+      <p class="muted small">پنل با SSH وارد سرور ایران می‌شود و خودش همه‌چیز را انجام می‌دهد: نصب پنل، ساخت و آزمایش بهترین تونل، بهینه‌سازی MTU، لینک و همگام‌سازی.
+        رمز فقط همین یک بار استفاده می‌شود و هیچ‌جا ذخیره نمی‌شود.</p>
+      <div id="irHttpWarn" class="warnbox hidden">⚠ این پنل روی HTTP است و رمز SSH بدون رمزنگاری به پنل می‌رسد. بهتر است «نصب با یک دستور» را انتخاب کنی یا اول HTTPS را روشن کنی.</div>
+      <div class="grid">
+        <label>نام سرور<input id="aName" maxlength="30" placeholder="Iran-1" required></label>
+        <label>آی‌پی سرور ایران<input id="aHost" dir="ltr" placeholder="1.2.3.4" required></label>
+        <label>پورت SSH<input id="aSsh" inputmode="numeric" value="22" required></label>
+        <label>رمز root سرور ایران<input id="aPass" type="password" autocomplete="off" required></label>
+        <label>نوع تونل
+          <select id="aTun"><option value="auto">خودکار (پیشنهادی)</option><option value="gre6">فقط GRE6</option><option value="gre4">فقط GRE4</option><option value="none">بدون تونل</option></select>
+        </label>
+        <label>پورت پنل روی ایران<input id="aPort" inputmode="numeric" value="9443"></label>
+      </div>
+      <label class="check"><input type="checkbox" id="aOpt" checked><span>بهینه‌سازی تونل (MTU واقعی، MSS، تنظیمات کرنل)</span></label>
+      <label class="check"><input type="checkbox" id="aRep"><span>اگر این سرور از پنل دیگری قانون می‌گیرد، جایگزین شود</span></label>
+      <p class="error" id="aErr"></p>
+      <div class="dlg-actions">
+        <button class="btn primary" type="submit">شروع نصب</button>
+        <button class="btn" type="button" data-close>انصراف</button>
+      </div>
+    </form>
+
+    <form id="irCmd" class="hidden">
+      <p class="muted small">فایل و SSH لازم نیست: یک دستور کوتاه می‌گیری که روی سرور ایران می‌زنی. دستور ۳۰ دقیقه اعتبار دارد و یک‌بار مصرف است؛ بعد از نصب هیچ فایلی روی سرور ایران نمی‌ماند.</p>
+      <div class="grid">
+        <label>نام سرور<input id="irName" maxlength="30" placeholder="Iran-1" required></label>
+        <label>پورت پنل روی ایران<input id="irPort" inputmode="numeric" value="9443" required></label>
+        <label>آی‌پی عمومی سرور ایران<input id="irIp" dir="ltr" placeholder="1.2.3.4" required></label>
+        <label>پروتکل پنل ایران
+          <select id="irScheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select>
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" id="irTun"><span>همزمان تونل GRE هم بین دو سرور ساخته شود</span></label>
+      <div id="irTunBox" class="grid hidden mt10">
+        <label>نام تونل<input id="tnName" dir="ltr" value="tun1" maxlength="15"></label>
+        <label>نوع تونل
+          <select id="tnKind"><option value="gre6">GRE6 (روی IPv6)</option><option value="gre4">GRE4 (روی IPv4)</option></select>
+        </label>
+        <label class="span2" id="lblFE">IPv6 همین سرور (خارج)<input id="tnFE" dir="ltr" list="epList"></label>
+        <datalist id="epList"></datalist>
+        <label class="span2" id="lblIE">IPv6 سرور ایران <small class="muted">(آدرس ثابت، نه آدرس خودکار ff:fe)</small><input id="tnIE" dir="ltr"></label>
+        <label>آی‌پی تونل سمت خارج<input id="tnF4" dir="ltr" value="192.168.70.2"></label>
+        <label>آی‌پی تونل سمت ایران<input id="tnI4" dir="ltr" value="192.168.70.1"></label>
+      </div>
+      <p class="error" id="irErr"></p>
+      <div class="dlg-actions">
+        <button class="btn primary" type="submit">ساخت دستور</button>
+        <button class="btn" type="button" data-close>انصراف</button>
+      </div>
+    </form>
+
+    <div id="irCmdOut" class="hidden">
+      <p>این دستور را روی <b>سرور ایران</b> (به‌عنوان root) بزن:</p>
+      <div class="keybox"><code id="irCmdText" dir="ltr"></code><button class="btn icon" id="irCmdCopy" type="button">کپی</button></div>
+      <p class="muted small" id="irCmdState">در انتظار نصب روی سرور ایران…</p>
+      <div class="dlg-actions">
+        <button class="btn" id="irCmdFile" type="button">دانلود به‌صورت فایل</button>
+        <button class="btn" type="button" data-close>بستن</button>
+      </div>
     </div>
-    <p class="error" id="irErr"></p>
-    <div class="dlg-actions">
-      <button class="btn primary" type="submit">ساخت و دانلود اسکریپت</button>
-      <button class="btn" type="button" id="irCancel">انصراف</button>
+
+    <div id="irProg" class="hidden">
+      <div class="prog" id="progList"></div>
+      <div id="progResult"></div>
+      <div class="dlg-actions"><button class="btn" id="progClose" type="button" disabled>بستن</button></div>
     </div>
-  </form>
+  </div>
 </dialog>
 
 <dialog id="nameDlg">

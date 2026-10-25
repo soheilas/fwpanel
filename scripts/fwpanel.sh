@@ -9,6 +9,7 @@
 #   fwpanel port [N]        change the panel port
 #   fwpanel tls on|off      switch between HTTPS and HTTP
 #   fwpanel allow-clear     remove the IP allow-list (if you locked yourself out)
+#   fwpanel add-iran        set up an Iran server over SSH (asks for its IP and root password) or print a one-line command
 #   fwpanel update          update to the latest release
 #   fwpanel uninstall       remove the panel (config is kept unless you say otherwise)
 REPO="soheilas/fwpanel"
@@ -94,6 +95,8 @@ do_tls() {
   sleep 3; ok "protocol switched"; echo "  new address: $(url)"
 }
 
+do_add_iran() { $PY add-iran "$@"; }
+
 do_update() {
   command -v curl >/dev/null || { err "curl is required"; return 1; }
   if ! curl -fsSL -m 15 -o /dev/null "https://raw.githubusercontent.com/$REPO/main/install.sh"; then
@@ -123,6 +126,7 @@ usage() {
   echo "  fwpanel port [N]      - change the panel port"
   echo "  fwpanel tls on|off    - HTTPS / HTTP"
   echo "  fwpanel allow-clear   - remove the IP allow-list"
+  echo "  fwpanel add-iran      - set up an Iran server (SSH or one-line command)"
   echo "  fwpanel update        - update to the latest release"
   echo "  fwpanel uninstall     - remove fwpanel"
   echo
@@ -147,11 +151,12 @@ menu() {
     echo "   8. Start        9. Stop        10. Restart"
     echo "  11. Status      12. View logs"
     echo "  13. Enable autostart   14. Disable autostart"
+    echo "  15. Add an Iran server (install + tunnel + sync)"
     echo "  ------------------------------------------------"
     printf "  state: "; running && printf "${green}running${plain}" || printf "${red}stopped${plain}"
     printf "   autostart: "; enabled && printf "${green}yes${plain}" || printf "${yellow}no${plain}"
     printf "\n  address: %s\n\n" "$(url)"
-    read -r -p "  Please enter your choice [0-14]: " c
+    read -r -p "  Please enter your choice [0-15]: " c
     case "$c" in
       0) exit 0 ;;
       1) do_update; pause ;;
@@ -168,6 +173,7 @@ menu() {
       12) journalctl -u fwpanel --no-pager -n 60; pause ;;
       13) systemctl enable fwpanel >/dev/null 2>&1 && ok "autostart enabled"; pause ;;
       14) systemctl disable fwpanel >/dev/null 2>&1 && ok "autostart disabled"; pause ;;
+      15) do_add_iran; pause ;;
       *) err "invalid choice"; sleep 1 ;;
     esac
   done
@@ -187,6 +193,7 @@ case "${1:-}" in
   port)          do_port "${2:-}" ;;
   tls)           do_tls "${2:-}" ;;
   allow-clear)   $PY allow clear ;;
+  add-iran)      shift; do_add_iran "$@" ;;
   update)        shift; do_update "$@" ;;
   uninstall)     do_uninstall ;;
   version|-v|--version) version ;;

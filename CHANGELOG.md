@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.0
+- **Install the Iran side from the foreign server only.** `install.sh` now asks "Set up an Iran server now?"; it needs just the Iran IP and root password,
+  installs the panel over SSH (password via askpass, temporary key removed afterwards), negotiates GRE6 -> GRE4 -> direct with a real traffic test,
+  optimises the tunnel on both ends, links sync and prints a summary. Also `fwpanel add-iran`, `install.sh --iran HOST|--no-iran`, and a wizard in the panel with live progress.
+- **One-line command mode:** a one-time `/dl/<token>` installer served by the foreign panel (no SSH, no GitHub) that deletes itself after installing.
+- **Tunnel engine:** tunnels card with health test (loss / RTT / jitter), PMTU discovery with DF pings, MTU = path MTU - GRE overhead, TCP MSS clamp (mangle chain),
+  kernel tuning (BBR, fq, buffers, rp_filter, ip_forward), one-click repair, restart, delete, manual MTU.
+- Removed `setup-servers.sh` / `--setup` (replaced by the above).
+
 ## 1.5.0
 - GRE4 (GRE over IPv4) tunnels next to GRE6: tunnel type choice in the "add Iran server" wizard, `--kind gre4|gre6` in the installer,
   `--tunnel-type auto|gre6|gre4` in the two-server setup script (auto = GRE6 over a working IPv6 pair, otherwise GRE4).

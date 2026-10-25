@@ -19,6 +19,7 @@ Usage:
 import argparse
 import base64
 import getpass
+import glob
 import hashlib
 import hmac
 import io
@@ -31,9 +32,11 @@ import signal
 import socket
 import ssl
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -42,7 +45,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 CONF_DIR = os.environ.get("FWPANEL_DIR", "/etc/fwpanel")
 DRY = os.environ.get("FWPANEL_DRY") == "1"
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -53,8 +56,8 @@ ADMIN_TOKEN_FILE = os.path.join(CONF_DIR, "admin.token")
 CERT_FILE = os.path.join(CONF_DIR, "cert.pem")
 KEY_FILE = os.path.join(CONF_DIR, "key.pem")
 
-PRE, POST, FWD = "FWPANEL_PRE", "FWPANEL_POST", "FWPANEL_FWD"
-JUMPS = [("nat", "PREROUTING", PRE), ("nat", "POSTROUTING", POST), ("filter", "FORWARD", FWD)]
+PRE, POST, FWD, MSS = "FWPANEL_PRE", "FWPANEL_POST", "FWPANEL_FWD", "FWPANEL_MSS"
+JUMPS = [("nat", "PREROUTING", PRE), ("nat", "POSTROUTING", POST), ("filter", "FORWARD", FWD), ("mangle", "FORWARD", MSS)]
 PBKDF_ITERS = 200_000
 SESSION_TTL = 12 * 3600
 MAX_BODY = 256 * 1024
@@ -147,7 +150,13 @@ def build_restore(rules):
     flt += allow
     nat.append("COMMIT")
     flt.append("COMMIT")
-    return "\n".join(nat + flt) + "\n"
+    # TCP MSS clamp on every fwpanel tunnel, so big packets never get black-holed inside the tunnel
+    mng = ["*mangle", f":{MSS} - [0:0]"]
+    for tname in tunnel_names():
+        for d in ("-o", "-i"):
+            mng.append(f"-A {MSS} {d} {tname} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
+    mng.append("COMMIT")
+    return "\n".join(nat + flt + mng) + "\n"
 
 
 def jump_first(table, parent, chain):
@@ -692,7 +701,7 @@ def sync_worker():
 
 def public_link(l):
     return {"id": l["id"], "name": l["name"], "url": l["url"], "tunnel_ip": l["tunnel_ip"],
-            "enabled": l.get("enabled", True), "status": l.get("status"), "installer": bool(l.get("boot")),
+            "enabled": l.get("enabled", True), "status": l.get("status"), "installer": bool(l.get("boot")), "installed": bool(l.get("installed")),
             "tunnel": (l.get("boot") or {}).get("tunnel", {}).get("name", ""),
             "tunnel_kind": (l.get("boot") or {}).get("tunnel", {}).get("kind", "gre6") if (l.get("boot") or {}).get("tunnel") else ""}
 
@@ -815,11 +824,28 @@ def settings_set(data, client_ip):
 
 
 # ------------------------------------------------------------------ tunnels --
+# GRE tunnels managed by fwpanel: one script + one systemd unit per tunnel (fwp-tunnel-NAME).
+# The engine can test a tunnel, discover the real path MTU and set it, clamp TCP MSS, tune the kernel and repair common problems.
 
 TUN_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,14}$")
+TUN_DIR = os.environ.get("FWPANEL_TUNDIR", "/usr/local/sbin")
+UNIT_DIR = os.environ.get("FWPANEL_UNITDIR", "/etc/systemd/system")
+OVERHEAD = {"gre4": 24, "gre6": 44}       # outer IP header + GRE header
+DEFAULT_TUN_MTU = 1440
+TUNE = [   # (sysctl key, wanted value, "raise" = only ever increase numeric values)
+    ("net.ipv4.ip_forward", "1", None),
+    ("net.ipv4.conf.all.rp_filter", "2", None),
+    ("net.ipv4.conf.default.rp_filter", "2", None),
+    ("net.ipv4.tcp_mtu_probing", "1", None),
+    ("net.core.default_qdisc", "fq", None),
+    ("net.ipv4.tcp_congestion_control", "bbr", None),
+    ("net.core.rmem_max", "67108864", "raise"),
+    ("net.core.wmem_max", "67108864", "raise"),
+    ("net.core.netdev_max_backlog", "16384", "raise"),
+]
 
 
-def tunnel_files(name, kind, local, remote, ip_cidr):
+def tunnel_files(name, kind, local, remote, ip_cidr, mtu=DEFAULT_TUN_MTU):
     """Systemd-managed tunnel: kind 'gre6' (GRE over IPv6) or 'gre4' (GRE over IPv4)."""
     if kind == "gre4":
         add = f"ip tunnel add $IF mode gre local {local} remote {remote} ttl 255 2>/dev/null"
@@ -832,7 +858,7 @@ case "$1" in
 up)
  {add}
  ip addr add {ip_cidr} dev $IF 2>/dev/null
- ip link set $IF mtu 1440 txqueuelen 10000 up
+ ip link set $IF mtu {mtu} txqueuelen 10000 up
  ;;
 down) ip link del $IF 2>/dev/null ;;
 esac
@@ -846,8 +872,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/fwp-tunnel-{name}.sh up
-ExecStop=/usr/local/sbin/fwp-tunnel-{name}.sh down
+ExecStart={TUN_DIR}/fwp-tunnel-{name}.sh up
+ExecStop={TUN_DIR}/fwp-tunnel-{name}.sh down
 
 [Install]
 WantedBy=multi-user.target
@@ -855,32 +881,342 @@ WantedBy=multi-user.target
     return script, unit
 
 
-def create_tunnel_local(name, kind, local, remote, ip_cidr):
-    script, unit = tunnel_files(name, kind, local, remote, ip_cidr)
+def parse_tunnel_script(name, txt):
+    kind = "gre6" if "ip6gre" in txt else "gre4"
+    m = re.search(r"local (\S+) remote (\S+) ttl", txt)
+    ip = re.search(r"ip addr add (\S+) dev", txt)
+    mtu = re.search(r"mtu (\d+)", txt)
+    cidr = ip.group(1) if ip else ""
+    peer = ""
+    try:
+        iface = ipaddress.ip_interface(cidr)
+        hosts = [str(h) for h in iface.network.hosts() if h != iface.ip]
+        peer = hosts[0] if hosts else ""
+    except ValueError:
+        pass
+    return {"name": name, "kind": kind, "local": m.group(1) if m else "", "remote": m.group(2) if m else "",
+            "ip": cidr, "peer_ip": peer, "mtu": int(mtu.group(1)) if mtu else DEFAULT_TUN_MTU}
+
+
+def live_link(name, fallback_mtu):
     if DRY:
-        log(f"[dry] create {kind} tunnel {name} {local} -> {remote} {ip_cidr}")
+        return {"up": True, "mtu_live": fallback_mtu, "rx": 0, "tx": 0}
+    rc, out, _ = run(["ip", "-j", "-s", "link", "show", name])
+    try:
+        j = json.loads(out)[0]
+        st = j.get("stats64") or j.get("stats") or {}
+        return {"up": "UP" in j.get("flags", []) and "LOWER_UP" in j.get("flags", []), "mtu_live": j.get("mtu"),
+                "rx": (st.get("rx") or {}).get("bytes", 0), "tx": (st.get("tx") or {}).get("bytes", 0)}
+    except (ValueError, IndexError, TypeError, KeyError):
+        return {"up": False, "mtu_live": None, "rx": 0, "tx": 0}
+
+
+def list_tunnels(live=True):
+    res = []
+    for path in sorted(glob.glob(os.path.join(TUN_DIR, "fwp-tunnel-*.sh"))):
+        name = os.path.basename(path)[len("fwp-tunnel-"):-3]
+        try:
+            with open(path) as f:
+                t = parse_tunnel_script(name, f.read())
+        except OSError:
+            continue
+        if live:
+            t.update(live_link(name, t["mtu"]))
+        res.append(t)
+    return res
+
+
+def tunnel_names():
+    return [os.path.basename(p)[len("fwp-tunnel-"):-3] for p in sorted(glob.glob(os.path.join(TUN_DIR, "fwp-tunnel-*.sh")))]
+
+
+def find_tunnel(name):
+    for t in list_tunnels():
+        if t["name"] == name:
+            return t
+    raise KeyError(name)
+
+
+def validate_tunnel(name, kind, local, remote, ip_cidr):
+    if not TUN_NAME_RE.match(name or ""):
+        raise ValueError("نام تونل: حروف کوچک انگلیسی/عدد، حداکثر ۱۵ کاراکتر")
+    if kind not in ("gre4", "gre6"):
+        raise ValueError("نوع تونل باید gre4 یا gre6 باشد")
+    cls = ipaddress.IPv4Address if kind == "gre4" else ipaddress.IPv6Address
+    try:
+        loc, rem = str(cls(str(local).strip())), str(cls(str(remote).strip()))
+    except ValueError:
+        raise ValueError("آدرس " + ("IPv4" if kind == "gre4" else "IPv6") + " دو سر تونل نامعتبر است")
+    if loc == rem:
+        raise ValueError("آدرس دو سر تونل نباید یکی باشد")
+    try:
+        iface = ipaddress.ip_interface(ip_cidr)
+        if iface.version != 4 or iface.network.prefixlen != 30:
+            raise ValueError
+    except ValueError:
+        raise ValueError("آی‌پی تونل باید به شکل A.B.C.D/30 باشد")
+    return loc, rem, str(iface)
+
+
+def write_tunnel(name, kind, local, remote, ip_cidr, mtu):
+    script, unit = tunnel_files(name, kind, local, remote, ip_cidr, mtu)
+    if DRY and not os.environ.get("FWPANEL_TUNDIR"):
+        log(f"[dry] write tunnel {name} {kind} {local} -> {remote} {ip_cidr} mtu {mtu}")
         return
-    with open(f"/usr/local/sbin/fwp-tunnel-{name}.sh", "w") as f:
+    os.makedirs(TUN_DIR, exist_ok=True)
+    path = os.path.join(TUN_DIR, f"fwp-tunnel-{name}.sh")
+    with open(path, "w") as f:
         f.write(script)
-    os.chmod(f"/usr/local/sbin/fwp-tunnel-{name}.sh", 0o755)
-    with open(f"/etc/systemd/system/fwp-tunnel-{name}.service", "w") as f:
+    os.chmod(path, 0o755)
+    with open(os.path.join(UNIT_DIR, f"fwp-tunnel-{name}.service"), "w") as f:
         f.write(unit)
+
+
+def create_tunnel_local(name, kind, local, remote, ip_cidr, mtu=DEFAULT_TUN_MTU):
+    write_tunnel(name, kind, local, remote, ip_cidr, mtu)
+    if DRY:
+        return
     run(["systemctl", "daemon-reload"])
     rc, _, err = run(["systemctl", "enable", "--now", f"fwp-tunnel-{name}.service"])
     if rc != 0:
         raise RuntimeError(err.strip() or "systemctl enable failed")
+    try:
+        with LOCK:
+            apply_all(RULES)      # adds the MSS clamp for the new tunnel
+    except Exception as e:
+        log(f"apply after tunnel create failed: {e}")
 
 
-def ping6_ok(local6, remote6):
+def ping_stats(out):
+    loss = re.search(r"(\d+(?:\.\d+)?)% packet loss", out or "")
+    rtt = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", out or "")
+    return (float(loss.group(1)) if loss else 100.0,
+            {"min": float(rtt.group(1)), "avg": float(rtt.group(2)), "max": float(rtt.group(3)), "jitter": float(rtt.group(4))} if rtt else None)
+
+
+def outer_ping(t, size, count=1):
+    v = "-6" if t["kind"] == "gre6" else "-4"
+    return run(["ping", v, "-c", str(count), "-W", "1", "-M", "do", "-s", str(size), "-I", t["local"], t["remote"]])[0] == 0
+
+
+def find_outer_pmtu(t):
+    """Largest packet the real path between the two tunnel endpoints carries (DF pings, binary search). None = no answer."""
     if DRY:
-        return True
-    return run(["ping", "-6", "-c", "2", "-W", "2", "-I", local6, remote6])[0] == 0
+        return 1500
+    hdr = 48 if t["kind"] == "gre6" else 28        # IP + ICMP headers
+    hi, lo = 1500 - hdr, 1280 - hdr
+    if outer_ping(t, hi):
+        return 1500
+    if not outer_ping(t, lo):
+        return None
+    while hi - lo > 1:
+        mid = (hi + lo) // 2
+        if outer_ping(t, mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo + hdr
+
+
+def tunnel_test(name):
+    t = find_tunnel(name)
+    res = {"name": name, "kind": t["kind"], "mtu": t.get("mtu_live") or t["mtu"], "up": t.get("up", False), "peer": t["peer_ip"], "ts": int(time.time())}
+    if DRY:
+        res.update(outer_ok=True, loss=0.0, rtt={"min": 0.8, "avg": 1.1, "max": 2.0, "jitter": 0.3}, status="healthy")
+        return res
+    v = "-6" if t["kind"] == "gre6" else "-4"
+    res["outer_ok"] = run(["ping", v, "-c", "3", "-W", "1", "-I", t["local"], t["remote"]])[0] == 0
+    _, out, _ = run(["ping", "-c", "10", "-i", "0.2", "-W", "1", t["peer_ip"]])
+    loss, rtt = ping_stats(out)
+    res.update(loss=loss, rtt=rtt)
+    if not res["up"] or loss >= 100:
+        res["status"] = "down"
+    elif loss > 2 or (rtt and rtt["max"] > rtt["avg"] * 5 + 20):
+        res["status"] = "degraded"
+    else:
+        res["status"] = "healthy"
+    return res
+
+
+def set_tunnel_mtu(t, mtu):
+    run(["ip", "link", "set", t["name"], "mtu", str(mtu)])
+    write_tunnel(t["name"], t["kind"], t["local"], t["remote"], t["ip"], mtu)
+
+
+def tune_system():
+    """Kernel settings that matter for forwarding: BBR + fq, big socket buffers, loose rp_filter, ip_forward."""
+    steps = []
+    if DRY:
+        return [{"ok": True, "msg": "تنظیمات کرنل (در حالت dry اعمال نشد)"}]
+    run(["modprobe", "tcp_bbr"])
+    try:
+        with open("/proc/sys/net/ipv4/tcp_available_congestion_control") as f:
+            have_bbr = "bbr" in f.read().split()
+    except OSError:
+        have_bbr = False
+    lines = []
+    for key, want, mode in TUNE:
+        path = "/proc/sys/" + key.replace(".", "/")
+        if key.endswith("congestion_control") and not have_bbr:
+            steps.append({"ok": False, "msg": "BBR در این کرنل نیست؛ همان الگوریتم فعلی می‌ماند"})
+            continue
+        try:
+            with open(path) as f:
+                cur = f.read().strip()
+        except OSError:
+            continue
+        if mode == "raise" and cur.isdigit() and int(cur) >= int(want):
+            want = cur
+        if cur != want:
+            try:
+                with open(path, "w") as f:
+                    f.write(want)
+                steps.append({"ok": True, "msg": f"{key}: {cur} ← {want}"})
+            except OSError as e:
+                steps.append({"ok": False, "msg": f"{key}: {e}"})
+                continue
+        lines.append(f"{key}={want}")
+    try:
+        with open("/etc/sysctl.d/98-fwpanel-tune.conf", "w") as f:
+            f.write("# written by fwpanel\n" + "\n".join(lines) + "\n")
+    except OSError:
+        pass
+    if not steps:
+        steps.append({"ok": True, "msg": "تنظیمات کرنل از قبل مناسب بود"})
+    return steps
+
+
+def tunnel_optimize(name):
+    t = find_tunnel(name)
+    steps = []
+    before = t.get("mtu_live") or t["mtu"]
+    pm = find_outer_pmtu(t)
+    if pm is None:
+        target = 1400
+        steps.append({"ok": False, "msg": f"مسیر بین دو سر تونل به بسته‌ی بزرگ جواب نداد؛ MTU امن {target} گذاشته شد"})
+    else:
+        target = max(1280, pm - OVERHEAD[t["kind"]])
+        steps.append({"ok": True, "msg": f"حداکثر بسته‌ی مسیر واقعی: {pm} ← MTU تونل: {target}"})
+    set_tunnel_mtu(t, target)
+    if not DRY and t["peer_ip"] and run(["ping", "-c", "2", "-W", "1", t["peer_ip"]])[0] == 0:
+        # verify end to end with full-size packets; step down until they pass
+        while target > 1280 and run(["ping", "-c", "2", "-W", "1", "-M", "do", "-s", str(target - 28), t["peer_ip"]])[0] != 0:
+            target = max(1280, target - 16)
+            set_tunnel_mtu(t, target)
+            steps.append({"ok": False, "msg": f"بسته‌ی کامل از تونل رد نشد؛ MTU به {target} کاهش یافت"})
+        steps.append({"ok": True, "msg": f"تست بسته‌ی کامل با MTU {target} از داخل تونل: موفق"})
+    elif not DRY:
+        steps.append({"ok": False, "msg": "سر مقابل جواب نداد؛ تست بسته‌ی کامل انجام نشد"})
+    try:
+        with LOCK:
+            apply_all(RULES)
+        steps.append({"ok": True, "msg": "کلمپ MSS برای TCP روی تونل فعال شد"})
+    except Exception as e:
+        steps.append({"ok": False, "msg": f"کلمپ MSS: {e}"})
+    steps += tune_system()
+    return {"name": name, "mtu_before": before, "mtu_after": target, "outer_pmtu": pm, "steps": steps}
+
+
+def tunnel_fix(name):
+    """Diagnose a tunnel and repair what can be repaired automatically."""
+    t = find_tunnel(name)
+    checks = []
+
+    def add(ok, msg, fixed=False):
+        checks.append({"ok": ok, "msg": msg, "fixed": fixed})
+
+    script = os.path.join(TUN_DIR, f"fwp-tunnel-{name}.sh")
+    if DRY:
+        return [{"ok": True, "msg": "بررسی (حالت dry)", "fixed": False}]
+    rc = run(["ip", "link", "show", name])[0]
+    if rc != 0:
+        run(["bash", script, "up"])
+        add(run(["ip", "link", "show", name])[0] == 0, "اینترفیس تونل وجود نداشت؛ دوباره ساخته شد", True)
+    else:
+        add(True, "اینترفیس تونل وجود دارد")
+    live = live_link(name, t["mtu"])
+    if not live["up"]:
+        run(["ip", "link", "set", name, "up"])
+        add(live_link(name, t["mtu"])["up"], "اینترفیس پایین بود؛ بالا آمد", True)
+    else:
+        add(True, "اینترفیس بالاست")
+    if t["ip"] and t["ip"].split("/")[0] not in run(["ip", "-o", "addr", "show", "dev", name])[1]:
+        run(["ip", "addr", "add", t["ip"], "dev", name])
+        add(True, f"آی‌پی {t['ip']} روی تونل نبود؛ اضافه شد", True)
+    else:
+        add(True, "آی‌پی تونل درست است")
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            fwd = f.read().strip()
+        if fwd != "1":
+            set_ip_forward()
+        add(True, "ip_forward روشن است" if fwd == "1" else "ip_forward خاموش بود؛ روشن شد", fwd != "1")
+    except OSError:
+        pass
+    for key in (f"net.ipv4.conf.{name}.rp_filter", "net.ipv4.conf.all.rp_filter"):
+        path = "/proc/sys/" + key.replace(".", "/")
+        try:
+            with open(path) as f:
+                cur = f.read().strip()
+            if cur == "1":
+                with open(path, "w") as f:
+                    f.write("2")
+                add(True, f"{key} سخت‌گیرانه بود؛ روی حالت loose (۲) رفت", True)
+        except OSError:
+            pass
+    v = "-6" if t["kind"] == "gre6" else "-4"
+    outer = run(["ping", v, "-c", "3", "-W", "1", "-I", t["local"], t["remote"]])[0] == 0
+    add(outer, "سر مقابل از مسیر بیرونی جواب می‌دهد" if outer else
+        "سر مقابل از مسیر بیرونی جواب نمی‌دهد: آدرس دو سر، فایروال سرور یا مسیر شبکه را بررسی کن")
+    peer = run(["ping", "-c", "3", "-W", "1", t["peer_ip"]])[0] == 0 if t["peer_ip"] else False
+    if peer:
+        add(True, "از داخل تونل پینگ سر مقابل جواب می‌دهد")
+    elif outer and t["kind"] == "gre4":
+        add(False, "مسیر بیرونی سالم است ولی از داخل تونل جواب نمی‌آید: احتمالاً GRE (پروتکل ۴۷) فیلتر است؛ تونل GRE6 را امتحان کن")
+    else:
+        add(False, "از داخل تونل جواب نمی‌آید: مطمئن شو سر مقابل هم ساخته شده و آی‌پی‌ها درست است")
+    drop = run(["iptables", "-S", "INPUT"])[1]
+    if re.search(r"-j (DROP|REJECT)", drop) and re.search(r"-p (gre|47)|--protocol (gre|47)", drop):
+        add(False, "یک قانون فایروال بسته‌های GRE را می‌اندازد (iptables INPUT)")
+    return checks
+
+
+def tunnel_restart(name):
+    find_tunnel(name)
+    if DRY:
+        return
+    rc, _, err = run(["systemctl", "restart", f"fwp-tunnel-{name}.service"])
+    if rc != 0:
+        script = os.path.join(TUN_DIR, f"fwp-tunnel-{name}.sh")
+        run(["bash", script, "down"])
+        run(["bash", script, "up"])
+
+
+def tunnel_delete(name, force=False):
+    find_tunnel(name)
+    used = [l["name"] for l in CONFIG.get("links", []) if (l.get("boot") or {}).get("tunnel", {}).get("name") == name]
+    if used and not force:
+        raise ValueError("این تونل برای لینک «" + "، ".join(used) + "» ساخته شده؛ با «حذف اجباری» پاک می‌شود")
+    if not DRY or os.environ.get("FWPANEL_TUNDIR"):
+        run(["systemctl", "disable", "--now", f"fwp-tunnel-{name}.service"])
+        for path in (os.path.join(TUN_DIR, f"fwp-tunnel-{name}.sh"), os.path.join(UNIT_DIR, f"fwp-tunnel-{name}.service")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        run(["systemctl", "daemon-reload"])
+        run(["ip", "link", "del", name])
+        try:
+            with LOCK:
+                apply_all(RULES)
+        except Exception as e:
+            log(f"apply after tunnel delete failed: {e}")
 
 
 # ---------------------------------------------------------------- installer --
 
-def payload_b64():
-    """This panel's files (code, web assets, scripts) as a flat base64 tar.gz - the layout install.sh expects.
+def payload_bytes():
+    """This panel's files (code, web assets, scripts) as a flat tar.gz - the layout install.sh expects.
 
     Works both from a repo checkout (src/ + scripts/) and from an installed copy (/opt/fwpanel, everything flat).
     """
@@ -899,25 +1235,45 @@ def payload_b64():
             if src:
                 t.add(src, arcname=arc)
         t.add(WEB_DIR, arcname="web")
-    return base64.encodebytes(buf.getvalue()).decode()
+    return buf.getvalue()
 
 
-def build_installer(args):
-    """Self-extracting installer: this panel's own files + the install.sh arguments."""
-    payload = payload_b64()
+def payload_b64():
+    return base64.encodebytes(payload_bytes()).decode()
+
+
+def build_installer(args, callback="", optimize=""):
+    """Self-extracting installer (works as a file, from `curl | bash` and from `bash <(curl ...)`): the panel's own files
+    sit in a here-document, so the script never needs to re-read itself. It deletes itself when run from a file."""
     head = (
         "#!/usr/bin/env bash\n"
         f"# fwpanel {VERSION} - self-extracting installer\n"
-        "set -euo pipefail\n"
+        "set -uo pipefail\n"
         f"ARGS=({' '.join(shlex.quote(str(a)) for a in args)})\n"
-        '[ "$(id -u)" = 0 ] || { echo "run as root (sudo bash $0)" >&2; exit 1; }\n'
+        f"FWP_CB={shlex.quote(callback)}\n"
+        f"FWP_OPT={shlex.quote(optimize)}\n"
+        '[ "$(id -u)" = 0 ] || { echo "run as root (sudo -i first)" >&2; exit 1; }\n'
         'TMP="$(mktemp -d)"; trap \'rm -rf "$TMP"\' EXIT\n'
-        'awk \'/^__PAYLOAD__$/ {p=1; next} p\' "$0" | base64 -d | tar -xz -C "$TMP"\n'
-        'bash "$TMP/install.sh" "${ARGS[@]}" "$@"\n'
-        "exit 0\n"
-        "__PAYLOAD__\n"
+        "base64 -d <<'__FWPANEL_PAYLOAD__' | tar -xz -C \"$TMP\" || { echo \"corrupt installer\" >&2; exit 1; }\n"
     )
-    return (head + payload).encode()
+    tail = (
+        "__FWPANEL_PAYLOAD__\n"
+        'RC=0; bash "$TMP/install.sh" "${ARGS[@]}" "$@" || RC=$?\n'
+        'if [ $RC -eq 0 ] && [ -n "$FWP_OPT" ]; then\n'
+        '  echo "optimizing the tunnel (MTU, MSS, kernel)..."\n'
+        '  python3 /opt/fwpanel/fwpanel.py admin POST "/api/tunnels/$FWP_OPT/optimize" >/dev/null 2>&1 || true\n'
+        "fi\n"
+        'if [ -n "$FWP_CB" ]; then\n'
+        '  curl -fsSk -m 20 -X POST -H "Content-Type: application/json" -d "{\\\"ok\\\": $([ $RC -eq 0 ] && echo true || echo false)}" "$FWP_CB" >/dev/null 2>&1 || true\n'
+        "fi\n"
+        'case "$0" in /dev/*|bash|-bash|sh) ;; *) [ -f "$0" ] && rm -f "$0" 2>/dev/null ;; esac\n'
+        "exit $RC\n"
+    )
+    return (head + payload_b64() + tail).encode()
+
+
+def installer_tunnel_name(link):
+    return ((link.get("boot") or {}).get("tunnel") or {}).get("name", "")
 
 
 def installer_args(link):
@@ -929,6 +1285,383 @@ def installer_args(link):
         a += ["--tunnel", t["name"], "--kind", kind, "--local", t.get("iran_ep") or t["iran_v6"],
               "--remote", t.get("foreign_ep") or t["foreign_v6"], "--ip", t["iran_ip"] + "/30"]
     return a
+
+
+# ------------------------------------------------------------ iran install jobs --
+# "Add Iran server" without touching the Iran server by hand: this panel SSHes in (password asked once, never stored),
+# installs the panel there, builds and tests the best tunnel, optimises it, links the panels and syncs the rules.
+
+JOBS, JOBS_LOCK = {}, threading.Lock()
+SSH_BIN = os.environ.get("FWPANEL_SSH_BIN", "ssh")
+REMOTE_PY = os.environ.get("FWPANEL_REMOTE_PY", "/opt/fwpanel/fwpanel.py")      # these three exist only so tests can fake the remote
+REMOTE_ENV = os.environ.get("FWPANEL_REMOTE_ENV", "")
+REMOTE_TMP = os.environ.get("FWPANEL_REMOTE_TMP", "/root/.fwpanel-setup")
+DL_TOKENS = {}                                                                  # one-time "run this on the Iran server" tokens
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")
+
+
+def new_job(kind):
+    jid = secrets.token_hex(6)
+    job = {"id": jid, "kind": kind, "state": "running", "steps": [], "result": None, "ts": time.time()}
+    with JOBS_LOCK:
+        for k in [k for k, v in JOBS.items() if time.time() - v["ts"] > 3600]:
+            del JOBS[k]
+        JOBS[jid] = job
+    return job
+
+
+def jlog(job, level, fa, en=None):
+    job["steps"].append({"t": int(time.time()), "level": level, "msg": fa, "en": en or fa})
+
+
+def explain_ssh_error(err):
+    e = (err or "").strip()
+    if "Permission denied" in e:
+        return ("رمز اشتباه است، یا سرور ورود root با رمز را اجازه نمی‌دهد (PermitRootLogin / PasswordAuthentication)",
+                "wrong password, or the server does not allow root login with a password")
+    if "timed out" in e or "refused" in e or "No route" in e or "unreachable" in e:
+        return ("اتصال برقرار نشد: IP، پورت SSH یا فایروال سرور را بررسی کن", "cannot connect: check the IP, the SSH port and the firewall")
+    if "Could not resolve" in e:
+        return ("آدرس سرور پیدا نشد", "host name not found")
+    return (e[:200] or "اتصال SSH ناموفق بود", e[:200] or "SSH connection failed")
+
+
+class SshClient:
+    """ssh to the Iran server as root. The password is given to ssh through SSH_ASKPASS (never on a command line or in a file);
+    right after the first login a throw-away key is installed and used for the rest of the job, then removed again."""
+
+    def __init__(self, host, port, password="", identity="", jid="x"):
+        self.host, self.port, self.password, self.jid = host, int(port), password, jid
+        self.key, self.temp_key = identity or "", False
+        self.dir = tempfile.mkdtemp(prefix="fwp-ssh-")
+        os.chmod(self.dir, 0o700)
+        self.askpass = ""
+        if password and not identity:
+            self.askpass = os.path.join(self.dir, "askpass.sh")
+            with open(self.askpass, "w") as f:
+                f.write('#!/bin/sh\nprintf "%s\\n" "$FWP_SSH_PASS"\n')
+            os.chmod(self.askpass, 0o700)
+
+    def _args(self, mode):
+        a = [SSH_BIN, "-p", str(self.port), "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={self.dir}/known_hosts",
+             "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "LogLevel=ERROR"]
+        if mode == "key":
+            a += ["-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
+        else:
+            a += ["-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no", "-o", "NumberOfPasswordPrompts=1"]
+        return a + [f"root@{self.host}"]
+
+    def run(self, cmd, stdin=None, timeout=180, mode=None):
+        mode = mode or ("key" if self.key else "password")
+        env = dict(os.environ)
+        if mode == "password":
+            env.update(SSH_ASKPASS=self.askpass, SSH_ASKPASS_REQUIRE="force", FWP_SSH_PASS=self.password)
+            env.setdefault("DISPLAY", ":0")
+        try:
+            p = subprocess.run(self._args(mode) + [cmd], input=stdin, capture_output=True, env=env, timeout=timeout, start_new_session=True)
+        except subprocess.TimeoutExpired:
+            return 124, "", "timed out"
+        return p.returncode, p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+
+    def bootstrap(self):
+        if self.key:                                   # key file given: no password needed
+            rc, _, err = self.run("true")
+            if rc != 0:
+                raise RuntimeError(explain_ssh_error(err)[0])
+            return
+        if not self.password:
+            raise RuntimeError("رمز root سرور ایران لازم است")
+        rc, _, err = self.run("true", mode="password")
+        if rc != 0:
+            raise RuntimeError(explain_ssh_error(err)[0])
+        keypath = os.path.join(self.dir, "key")
+        rc = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"fwpanel-temp-{self.jid}", "-f", keypath]).returncode
+        if rc != 0:
+            raise RuntimeError("ساخت کلید موقت SSH ناموفق بود (openssh-client نصب است؟)")
+        with open(keypath + ".pub", "rb") as f:
+            pub = f.read()
+        rc, _, err = self.run("umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys", stdin=pub, mode="password")
+        if rc != 0:
+            raise RuntimeError(explain_ssh_error(err)[0])
+        self.key, self.temp_key = keypath, True
+        rc, _, err = self.run("true")
+        if rc != 0:
+            raise RuntimeError("ورود با کلید موقت ناموفق بود: " + explain_ssh_error(err)[0])
+
+    def fingerprints(self):
+        try:
+            out = subprocess.run(["ssh-keygen", "-lf", f"{self.dir}/known_hosts"], capture_output=True, text=True, timeout=10).stdout
+            return [l.split()[1] for l in out.splitlines() if len(l.split()) > 1][:2]
+        except Exception:
+            return []
+
+    def cleanup(self):
+        if self.temp_key and self.key:
+            self.run(f"sed -i '/fwpanel-temp-{self.jid}/d' ~/.ssh/authorized_keys", timeout=30)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def radmin(ssh, method, path, body=None, timeout=180):
+    """Call the panel on the remote server through its local admin CLI."""
+    cmd = f"{REMOTE_ENV} python3 {REMOTE_PY} admin {method} '{path}'" + (" -" if body is not None else "")
+    rc, out, err = ssh.run(cmd, stdin=json.dumps(body).encode() if body is not None else None, timeout=timeout)
+    if rc != 0:
+        raise RuntimeError(((err or out).strip()[:300]) or "remote call failed")
+    return json.loads(out or "{}")
+
+
+def v6_candidates(raw):
+    return sorted(set(re.findall(r"inet6 ([0-9a-f:]+)/\d+", raw or "")), key=lambda a: ("ff:fe" in a, a))
+
+
+def used_inner_nets(local_tunnels, remote_tunnels):
+    nets = set()
+    for t in list(local_tunnels) + list(remote_tunnels):
+        try:
+            nets.add(ipaddress.ip_interface(t["ip"]).network)
+        except (ValueError, KeyError):
+            pass
+    return nets
+
+
+def free_inner_net(used):
+    for i in range(64):
+        n = ipaddress.ip_network(f"192.168.70.{i * 4}/30")
+        if n not in used:
+            return n
+    raise RuntimeError("رنج آی‌پی داخلی تونل‌ها پر شده")
+
+
+def free_tunnel_name(local_names, remote_names):
+    for i in range(1, 100):
+        if f"tun{i}" not in local_names and f"tun{i}" not in remote_names:
+            return f"tun{i}"
+    raise RuntimeError("اسم آزاد برای تونل پیدا نشد")
+
+
+def pair_loss(ssh, local_peer, remote_peer):
+    """Loss (%) of 5 pings through the tunnel in both directions; None when it could not be measured."""
+    if DRY:
+        return 0.0, 0.0
+    _, out, _ = run(["ping", "-c", "5", "-i", "0.2", "-W", "1", remote_peer])
+    a = ping_stats(out)[0]
+    _, o2, _ = ssh.run(f"ping -c 5 -i 0.2 -W 1 {local_peer}")
+    return a, ping_stats(o2)[0]
+
+
+def negotiate_tunnel(job, ssh, host, mode, remote_tunnels, remote_names):
+    """Try the possible tunnels in order (GRE6 over working IPv6 pairs first, then GRE4); keep the first one that really passes traffic."""
+    local_v6 = detect_ipv6()
+    _, raw, _ = ssh.run("ip -6 -o addr show scope global 2>/dev/null")
+    remote_v6 = v6_candidates(raw)
+    cands = []
+    if mode in ("auto", "gre6"):
+        jlog(job, "info", f"IPv6 این سرور: {len(local_v6)} آدرس • IPv6 سرور ایران: {len(remote_v6)} آدرس",
+             f"IPv6 here: {len(local_v6)} addr, Iran: {len(remote_v6)} addr")
+        tested = 0
+        for fv in local_v6:
+            for iv in remote_v6:
+                if tested >= 6:
+                    break
+                tested += 1
+                a = run(["ping", "-6", "-c", "2", "-W", "2", "-I", fv, iv])[0] == 0
+                b = ssh.run(f"ping -6 -c 2 -W 2 -I {iv} {fv} >/dev/null 2>&1")[0] == 0
+                if a and b:
+                    cands.append(("gre6", fv, iv))
+                    jlog(job, "ok", f"مسیر IPv6 سالم: {fv} ↔ {iv}", f"working IPv6 path: {fv} <-> {iv}")
+    if mode in ("auto", "gre4"):
+        fp = detect_primary_ip()
+        try:
+            public = bool(fp) and not ipaddress.ip_address(fp).is_private
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            public = False
+        if public:
+            cands.append(("gre4", fp, host))
+        else:
+            jlog(job, "warn", "GRE4 ممکن نیست (هر دو سرور باید IPv4 عمومی داشته باشند و پشت NAT نباشند)", "GRE4 not possible (needs public IPv4 on both, no NAT)")
+    if not cands:
+        return None
+    local_t = list_tunnels(live=False)
+    for kind, fep, iep in cands:
+        net = free_inner_net(used_inner_nets(local_t, remote_tunnels))
+        hosts = list(net.hosts())
+        iran_ip, foreign_ip = str(hosts[0]), str(hosts[1])
+        name = free_tunnel_name(tunnel_names(), remote_names)
+        jlog(job, "info", f"ساخت تونل {kind.upper()} ({name}) و آزمایش واقعی ترافیک…", f"creating {kind.upper()} tunnel {name} and testing real traffic...")
+        try:
+            create_tunnel_local(name, kind, fep, iep, f"{foreign_ip}/30")
+            radmin(ssh, "POST", "/api/tunnels", {"name": name, "kind": kind, "local": iep, "remote": fep, "ip": f"{iran_ip}/30"})
+            time.sleep(2)
+            la, lb = pair_loss(ssh, foreign_ip, iran_ip)
+            if la is not None and lb is not None and la <= 20 and lb <= 20:
+                jlog(job, "ok", f"تونل {kind.upper()} سالم است (افت بسته: {la:.0f}٪ / {lb:.0f}٪)", f"{kind.upper()} tunnel works (loss {la:.0f}% / {lb:.0f}%)")
+                return {"name": name, "kind": kind, "foreign_ep": fep, "iran_ep": iep, "foreign_ip": foreign_ip, "iran_ip": iran_ip}
+            jlog(job, "warn", f"تونل {kind.upper()} ساخته شد ولی ترافیک رد نمی‌شود" +
+                 (" (احتمالاً GRE بین این دو سرور فیلتر است)" if kind == "gre4" else ""), f"{kind.upper()} tunnel built but no traffic passes")
+        except Exception as e:
+            jlog(job, "warn", f"ساخت تونل {kind.upper()} ناموفق: {e}", f"{kind.upper()} tunnel failed: {e}")
+        try:                                                       # remove the failed attempt on both ends
+            tunnel_delete(name, force=True)
+        except Exception:
+            pass
+        try:
+            radmin(ssh, "DELETE", f"/api/tunnels/{name}?force=1")
+        except Exception:
+            pass
+    return None
+
+
+def run_install_iran(job, p):
+    ssh = None
+    try:
+        host, port, scheme = p["host"], p["ssh_port"], p["scheme"]
+        secret = secrets.token_hex(32)
+        ssh = SshClient(host, port, p.get("password", ""), p.get("identity", ""), job["id"])
+        jlog(job, "info", f"اتصال به {host}:{port} …", f"connecting to {host}:{port} ...")
+        ssh.bootstrap()
+        fps = ssh.fingerprints()
+        jlog(job, "ok", "اتصال برقرار شد" + (f" (اثر انگشت سرور: {fps[0]})" if fps else ""), "connected" + (f" (host key {fps[0]})" if fps else ""))
+        p.pop("password", None)
+
+        rc, out, _ = ssh.run('echo uid=$(id -u); . /etc/os-release 2>/dev/null; echo os=${ID:-?}; '
+                             'for c in python3 iptables openssl curl; do command -v $c >/dev/null 2>&1 && echo have-$c=1 || echo have-$c=0; done; '
+                             'test -f /etc/fwpanel/config.json && python3 -c "import json;print(\'haskey=\' + str(int(bool(json.load(open(\'/etc/fwpanel/config.json\')).get(\'sync_secret\')))))" || echo haskey=0')
+        info = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+        if info.get("uid") != "0":
+            raise RuntimeError("روی سرور ایران باید با کاربر root وارد شوی")
+        if info.get("haskey") == "1" and not p.get("replace_key"):
+            raise RuntimeError("این سرور ایران از پنل دیگری قانون می‌گیرد. اگر می‌خواهی اینجا جایگزین شود، تیک «جایگزین کردن کلید قبلی» را بزن")
+        missing = [c for c in ("python3", "iptables", "openssl") if info.get(f"have-{c}") != "1"]
+        if missing:
+            jlog(job, "info", f"نصب پیش‌نیازها: {' '.join(missing)}", f"installing prerequisites: {' '.join(missing)}")
+            rc, out, err = ssh.run("DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 iptables openssl", timeout=600)
+            if rc != 0:
+                raise RuntimeError("نصب پیش‌نیازها روی سرور ایران ناموفق بود (دسترسی به مخزن apt؟): " + (err or out).strip()[-200:])
+
+        jlog(job, "info", "ارسال و نصب پنل روی سرور ایران…", "uploading and installing the panel on the Iran server...")
+        rc, _, err = ssh.run(f"rm -rf {REMOTE_TMP}; mkdir -p {REMOTE_TMP} && tar -xz -C {REMOTE_TMP}", stdin=payload_bytes(), timeout=300)
+        if rc != 0:
+            raise RuntimeError("ارسال فایل‌ها ناموفق بود: " + err.strip()[-200:])
+        args = f"--port {p['panel_port']} --{scheme} --sync-key {secret}" + (" --replace-key" if p.get("replace_key") else "")
+        rc, out, err = ssh.run(f"{REMOTE_ENV} bash {REMOTE_TMP}/install.sh {args} 2>&1; rc=$?; rm -rf {REMOTE_TMP}; exit $rc", timeout=900)
+        if rc != 0:
+            raise RuntimeError("نصب پنل ناموفق بود: " + out.strip()[-300:])
+        pw = re.search(r"^PASSWORD=(\S+)", out, re.M)
+        iran_password = pw.group(1) if pw else ""
+        for _ in range(15):
+            try:
+                radmin(ssh, "GET", "/api/state", timeout=20)
+                break
+            except Exception:
+                time.sleep(1)
+        else:
+            raise RuntimeError("پنل روی سرور ایران بالا نیامد")
+        jlog(job, "ok", "پنل روی سرور ایران نصب شد", "panel installed on the Iran server")
+
+        tun, target, url = None, "", f"{scheme}://{host}:{p['panel_port']}"
+        mode = p.get("tunnel", "auto")
+        if mode != "none":
+            remote_tunnels = radmin(ssh, "GET", "/api/tunnels").get("tunnels", [])
+            tun = negotiate_tunnel(job, ssh, host, mode, remote_tunnels, [t["name"] for t in remote_tunnels])
+        if tun:
+            target = tun["foreign_ip"]
+            url = f"{scheme}://{tun['iran_ip']}:{p['panel_port']}"
+            if p.get("optimize", True):
+                jlog(job, "info", "بهینه‌سازی تونل (کشف MTU واقعی، MSS، تنظیمات کرنل) روی هر دو سرور…", "optimizing the tunnel on both servers...")
+                for where, fn in (("این سرور", lambda: tunnel_optimize(tun["name"])),
+                                  ("سرور ایران", lambda: radmin(ssh, "POST", f"/api/tunnels/{tun['name']}/optimize", timeout=300))):
+                    try:
+                        r = fn()
+                        jlog(job, "ok", f"{where}: MTU {r['mtu_before']} ← {r['mtu_after']}", f"{where}: MTU {r['mtu_before']} -> {r['mtu_after']}")
+                        for st in r["steps"]:
+                            jlog(job, "info" if st["ok"] else "warn", "   " + st["msg"], "   " + st["msg"])
+                    except Exception as e:
+                        jlog(job, "warn", f"بهینه‌سازی {where} کامل نشد: {e}", f"optimize failed on {where}: {e}")
+        else:
+            if mode != "none":
+                jlog(job, "warn", "هیچ تونلی ممکن نشد؛ فوروارد بدون تونل و مستقیم از اینترنت انجام می‌شود", "no tunnel possible: falling back to a direct connection")
+            target = detect_primary_ip()
+            try:
+                if not target or ipaddress.ip_address(target).is_private:
+                    raise ValueError
+            except ValueError:
+                raise RuntimeError("بدون تونل، این سرور باید IPv4 عمومی داشته باشد (پشت NAT است؟)")
+
+        with LOCK:
+            links = CONFIG.setdefault("links", [])
+            link = {"id": max([l["id"] for l in links], default=0) + 1, "name": p["name"], "url": url, "tunnel_ip": target,
+                    "secret": secret, "enabled": True, "installed": True,
+                    "boot": {"port": p["panel_port"], "scheme": scheme, **({"tunnel": tun} if tun else {})}}
+            links.append(link)
+            save_json(CONF_FILE, CONFIG)
+        SYNC_EVENT.set()
+        st = sync_link(link["id"])
+        jlog(job, "ok" if st and st["ok"] else "warn", "همگام‌سازی: " + (st["msg"] if st else "-"), "sync: " + (st["msg"] if st else "-"))
+        tres = None
+        if tun:
+            try:
+                tres = tunnel_test(tun["name"])
+                jlog(job, "ok" if tres["status"] == "healthy" else "warn",
+                     f"تست نهایی تونل: {tres['status']} • افت {tres['loss']:.0f}٪ • تأخیر {((tres.get('rtt') or {}).get('avg', 0)):.1f}ms • MTU {tres['mtu']}",
+                     f"final tunnel test: {tres['status']}, loss {tres['loss']:.0f}%, rtt {((tres.get('rtt') or {}).get('avg', 0)):.1f}ms, MTU {tres['mtu']}")
+            except Exception as e:
+                jlog(job, "warn", f"تست نهایی تونل: {e}", f"final tunnel test failed: {e}")
+        job["result"] = {"link_id": link["id"], "name": p["name"], "panel_url": f"{scheme}://{host}:{p['panel_port']}/", "password": iran_password,
+                         "tunnel": tun, "test": tres, "sync": st}
+        jlog(job, "ok", "همه‌چیز آماده است", "all done")
+        job["state"] = "done"
+    except Exception as e:
+        jlog(job, "err", str(e))
+        job["state"] = "error"
+    finally:
+        p.pop("password", None)
+        if ssh:
+            try:
+                ssh.cleanup()
+            except Exception:
+                pass
+
+
+def start_install_job(d):
+    name = re.sub(r"[\x00-\x1f]", "", str(d.get("name", ""))).strip()[:30]
+    host = str(d.get("host", "")).strip()
+    if not name:
+        raise ValueError("نام لازم است")
+    if not HOST_RE.match(host):
+        raise ValueError("آدرس سرور ایران نامعتبر است")
+    p = {"name": name, "host": host, "ssh_port": to_port(d.get("ssh_port") or 22, "پورت SSH"), "panel_port": to_port(d.get("panel_port") or 9443, "پورت پنل ایران"),
+         "scheme": "https" if d.get("scheme") == "https" else "http", "tunnel": d.get("tunnel", "auto") if d.get("tunnel", "auto") in ("auto", "gre6", "gre4", "none") else "auto",
+         "optimize": bool(d.get("optimize", True)), "replace_key": bool(d.get("replace_key")),
+         "password": str(d.get("password", ""))[:256], "identity": str(d.get("identity", ""))[:300]}
+    if not p["password"] and not p["identity"]:
+        raise ValueError("رمز root سرور ایران لازم است")
+    if p["identity"] and not os.path.isfile(p["identity"]):
+        raise ValueError("فایل کلید پیدا نشد")
+    with LOCK:
+        for l in CONFIG.get("links", []):
+            if l["url"].split("//", 1)[-1].split(":")[0] == host:
+                raise ValueError("این سرور قبلاً لینک شده است")
+    job = new_job("install-iran")
+    threading.Thread(target=run_install_iran, args=(job, p), daemon=True).start()
+    return job
+
+
+def finish_command_install(link_id):
+    """Called when an Iran server finished the one-line install: sync, then test and optimise this end of the tunnel."""
+    try:
+        with LOCK:
+            link = next((l for l in CONFIG.get("links", []) if l["id"] == link_id), None)
+            if link:
+                link["installed"] = True
+                save_json(CONF_FILE, CONFIG)
+        time.sleep(2)
+        sync_link(link_id)
+        name = installer_tunnel_name(link or {})
+        if name:
+            tunnel_optimize(name)
+    except Exception as e:
+        log(f"finish install failed: {e}")
 
 
 # --------------------------------------------------------------------- http --
@@ -1009,7 +1742,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- routing
     def _gate(self, path):
-        if path != "/api/sync" and self.client_address[0] not in ("127.0.0.1", "::1") and not ip_allowed(self.client_address[0]):
+        if path != "/api/sync" and not path.startswith("/dl/") and self.client_address[0] not in ("127.0.0.1", "::1") and not ip_allowed(self.client_address[0]):
             self._err(403, "forbidden")
             return False
         return True
@@ -1018,6 +1751,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if not self._gate(path):
             return
+        if path.startswith("/dl/"):
+            return self._dl(path)
         if path.startswith("/api/"):
             return self._api("GET", path)
         files = {"/": "index.html", "/app.js": "app.js", "/app.css": "app.css", "/favicon.svg": "favicon.svg"}
@@ -1038,6 +1773,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         if self._gate(path):
+            if path.startswith("/dl/"):
+                return self._dl(path)
             self._api("POST", path)
 
     def do_PUT(self):
@@ -1104,6 +1841,60 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     apply_all(RULES)
                 return self._json(200, {"ok": True})
+            if path == "/api/tunnels" and method == "GET":
+                return self._json(200, {"tunnels": list_tunnels(), "linked": {(l.get("boot") or {}).get("tunnel", {}).get("name"): l["name"] for l in CONFIG.get("links", []) if (l.get("boot") or {}).get("tunnel")}})
+            if path == "/api/tunnels" and method == "POST":
+                d = self._body()
+                name = str(d.get("name", "")).strip()
+                loc, rem, cidr = validate_tunnel(name, str(d.get("kind", "")), d.get("local"), d.get("remote"), d.get("ip"))
+                if name in tunnel_names():
+                    raise ValueError("تونلی با این نام وجود دارد")
+                if run(["ip", "link", "show", name])[0] == 0 and not DRY:
+                    raise ValueError("یک اینترفیس با این نام روی سرور هست")
+                create_tunnel_local(name, d["kind"], loc, rem, cidr, int(d.get("mtu") or DEFAULT_TUN_MTU))
+                return self._json(200, {"ok": True})
+            m = re.fullmatch(r"/api/tunnels/([a-z][a-z0-9_-]{0,14})/(test|optimize|fix|restart)", path)
+            if m and method == "POST":
+                try:
+                    name, what = m.group(1), m.group(2)
+                    if what == "test":
+                        return self._json(200, {"result": tunnel_test(name)})
+                    if what == "optimize":
+                        return self._json(200, tunnel_optimize(name))
+                    if what == "fix":
+                        return self._json(200, {"checks": tunnel_fix(name)})
+                    tunnel_restart(name)
+                    return self._json(200, {"ok": True})
+                except KeyError:
+                    return self._err(404, "تونل پیدا نشد")
+            m = re.fullmatch(r"/api/tunnels/([a-z][a-z0-9_-]{0,14})", path)
+            if m and method == "PUT":
+                try:
+                    t = find_tunnel(m.group(1))
+                except KeyError:
+                    return self._err(404, "تونل پیدا نشد")
+                mtu = int(self._body().get("mtu", 0))
+                if not 1280 <= mtu <= 1500:
+                    raise ValueError("MTU باید بین ۱۲۸۰ تا ۱۵۰۰ باشد")
+                set_tunnel_mtu(t, mtu)
+                return self._json(200, {"ok": True, "mtu": mtu})
+            if m and method == "DELETE":
+                try:
+                    tunnel_delete(m.group(1), force="force=1" in self.path)
+                except KeyError:
+                    return self._err(404, "تونل پیدا نشد")
+                return self._json(200, {"ok": True})
+            if path == "/api/system/tune" and method == "POST":
+                return self._json(200, {"steps": tune_system()})
+            if path == "/api/iran/install" and method == "POST":
+                job = start_install_job(self._body())
+                return self._json(200, {"job": job["id"]})
+            m = re.fullmatch(r"/api/jobs/([0-9a-f]{12})", path)
+            if m and method == "GET":
+                job = JOBS.get(m.group(1))
+                if not job:
+                    return self._err(404, "کار پیدا نشد")
+                return self._json(200, {k: job[k] for k in ("id", "state", "steps", "result")})
             if path == "/api/settings" and method == "GET":
                 with LOCK:
                     return self._json(200, settings_get(self.client_address[0]))
@@ -1266,6 +2057,33 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             self._err(400, str(e))
 
+    def _dl(self, path):
+        """One-time install command for an Iran server:  curl .../dl/TOKEN | bash   (no SSH, nothing stored on the Iran disk)."""
+        now = time.time()
+        for k in [k for k, v in DL_TOKENS.items() if v["exp"] < now]:
+            del DL_TOKENS[k]
+        m = re.fullmatch(r"/dl/([A-Za-z0-9_-]{20,64})(/done)?", path)
+        tok = DL_TOKENS.get(m.group(1)) if m else None
+        if not m or not tok:
+            return self._err(404, "این آدرس منقضی شده یا قبلاً استفاده شده است")
+        with LOCK:
+            link = next((dict(l) for l in CONFIG.get("links", []) if l["id"] == tok["link_id"]), None)
+        if not link:
+            DL_TOKENS.pop(m.group(1), None)
+            return self._err(404, "لینک پیدا نشد")
+        if m.group(2):                                       # the Iran server reports back: verify from this side, then forget the token
+            DL_TOKENS.pop(m.group(1), None)
+            threading.Thread(target=finish_command_install, args=(link["id"],), daemon=True).start()
+            return self._json(200, {"ok": True})
+        tok["gets"] += 1
+        if tok["gets"] > 5:
+            DL_TOKENS.pop(m.group(1), None)
+            return self._err(404, "این آدرس منقضی شده است")
+        scheme = "https" if getattr(self.server, "tls", False) else "http"
+        cb = f"{scheme}://{self.headers.get('Host') or ('127.0.0.1:%s' % CONFIG.get('port'))}/dl/{m.group(1)}/done"
+        body = build_installer(installer_args(link), callback=cb, optimize=installer_tunnel_name(link))
+        self._send(200, body, "text/x-shellscript; charset=utf-8", {"Content-Disposition": "inline"})
+
     def _link_new_iran(self):
         d = self._body()
         name = re.sub(r"[\x00-\x1f]", "", str(d.get("name", ""))).strip()[:30]
@@ -1312,7 +2130,9 @@ class Handler(BaseHTTPRequestHandler):
             save_json(CONF_FILE, CONFIG)
             pub = public_link(link)
         SYNC_EVENT.set()
-        self._json(200, {"link": pub, "warnings": warnings})
+        token = secrets.token_urlsafe(24)
+        DL_TOKENS[token] = {"link_id": link["id"], "exp": time.time() + 1800, "gets": 0}
+        self._json(200, {"link": pub, "warnings": warnings, "token": token, "expires": int(time.time() + 1800)})
 
     def _link_installer(self, lid):
         with LOCK:
@@ -1517,6 +2337,86 @@ def cmd_admin(args):
     sys.stdout.buffer.write(data)
 
 
+def api_local(method, path, body=None):
+    """Call the running panel from this server (root-only admin token)."""
+    try:
+        with open(ADMIN_TOKEN_FILE) as f:
+            tok = f.read().strip()
+    except OSError:
+        sys.exit("no admin token - is fwpanel installed here? (run as root)")
+    cfg = load_json(CONF_FILE, {})
+    scheme = "https" if cfg.get("tls", True) and os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE) else "http"
+    req = urllib.request.Request(f"{scheme}://127.0.0.1:{cfg.get('port') or 9443}{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"X-Admin-Token": tok, "X-Requested-With": "fwpanel", "Content-Type": "application/json"})
+    ctx = ssl._create_unverified_context() if scheme == "https" else None
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", "")
+        except Exception:
+            msg = ""
+        sys.exit(msg or f"HTTP {e.code}")
+    except Exception as e:
+        sys.exit(f"cannot reach the panel: {e}")
+
+
+def watch_job(jid):
+    colors = {"ok": "\033[32m", "warn": "\033[33m", "err": "\033[31m", "info": "\033[36m"}
+    marks = {"ok": "+", "warn": "!", "err": "x", "info": ">"}
+    seen = 0
+    while True:
+        j = api_local("GET", f"/api/jobs/{jid}")
+        for st in j["steps"][seen:]:
+            print(f"  {colors.get(st['level'], '')}{marks.get(st['level'], '>')} {st['en']}\033[0m", flush=True)
+        seen = len(j["steps"])
+        if j["state"] != "running":
+            return j
+        time.sleep(1)
+
+
+def cmd_add_iran(args):
+    """Interactive: set up an Iran server from here (installs the panel there, builds + optimises the tunnel, links and syncs)."""
+    ask = lambda q, d="": (input(f"  {q}" + (f" [{d}]" if d else "") + ": ").strip() or d)
+    print("\n  Add an Iran server\n  ------------------")
+    host = args.host or ask("Iran server IP or host")
+    port = args.ssh_port or ask("SSH port", "22")
+    name = args.name or ask("Name for this server", "Iran-1")
+    pw = os.environ.get(args.password_env, "") if args.password_env else ""
+    if not pw and not args.identity:
+        pw = getpass.getpass("  root password of the Iran server (typed here, never stored): ")
+    body = {"name": name, "host": host, "ssh_port": port, "password": pw, "identity": args.identity or "", "tunnel": args.tunnel,
+            "panel_port": args.panel_port, "scheme": args.scheme, "optimize": not args.no_optimize, "replace_key": args.replace_key}
+    print()
+    jid = api_local("POST", "/api/iran/install", body)["job"]
+    j = watch_job(jid)
+    r = j.get("result") or {}
+    print()
+    if j["state"] == "done":
+        t = (r.get("test") or {})
+        print("  ============================================================")
+        print(f"   Iran server '{r['name']}' is ready")
+        print("  ============================================================")
+        print(f"   panel     : {r['panel_url']}")
+        print(f"   password  : {r.get('password') or '(unchanged, panel already existed)'}")
+        if r.get("tunnel"):
+            print(f"   tunnel    : {r['tunnel']['name']} ({r['tunnel']['kind'].upper()})  {r['tunnel']['iran_ip']} <-> {r['tunnel']['foreign_ip']}")
+            if t:
+                print(f"   health    : {t['status']}, loss {t['loss']:.0f}%, rtt {((t.get('rtt') or {}).get('avg', 0)):.1f} ms, MTU {t['mtu']}")
+        else:
+            print("   tunnel    : none (direct over the internet)")
+        print("   Create forwards in THIS panel: they appear on the Iran server automatically.")
+        return 0
+    print("  Failed. Nothing is left half-configured except what the log above shows.")
+    return 1
+
+
+def cmd_job_watch(args):
+    return 0 if watch_job(args.id)["state"] == "done" else 1
+
+
 def cmd_setkey(args):
     if not re.fullmatch(r"[0-9a-fA-F]{64}", args.key):
         sys.exit("sync key must be 64 hex characters")
@@ -1560,6 +2460,21 @@ def main():
     p.add_argument("path")
     p.add_argument("body", nargs="?")
     p.set_defaults(fn=cmd_admin)
+    p = sub.add_parser("add-iran")
+    p.add_argument("--host")
+    p.add_argument("--ssh-port", type=int)
+    p.add_argument("--name")
+    p.add_argument("--password-env", help="read the root password from this environment variable instead of asking")
+    p.add_argument("--identity", help="path of an SSH private key on this server (instead of a password)")
+    p.add_argument("--tunnel", default="auto", choices=["auto", "gre6", "gre4", "none"])
+    p.add_argument("--panel-port", type=int, default=9443)
+    p.add_argument("--scheme", default="http", choices=["http", "https"])
+    p.add_argument("--no-optimize", action="store_true")
+    p.add_argument("--replace-key", action="store_true")
+    p.set_defaults(fn=cmd_add_iran)
+    p = sub.add_parser("job-watch")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_job_watch)
     p = sub.add_parser("setkey")
     p.add_argument("key")
     p.set_defaults(fn=cmd_setkey)
@@ -1568,7 +2483,7 @@ def main():
     p.set_defaults(fn=cmd_allow)
     sub.add_parser("flush").set_defaults(fn=cmd_flush)
     args = ap.parse_args()
-    (args.fn if getattr(args, "fn", None) else cmd_serve)(args)
+    sys.exit((args.fn if getattr(args, "fn", None) else cmd_serve)(args) or 0)
 
 
 if __name__ == "__main__":
