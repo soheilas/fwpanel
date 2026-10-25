@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.6.1
+- Fix: the local admin CLI (`fwpanel add-iran`, installer, menu) failed with "unauthorized" on servers that have a blanket `MASQUERADE` rule, because that rule rewrites local connections to come from the server's own public IP. A source equal to the connection's own address now counts as local (the admin token is still required).
+
 ## 1.6.0
 - **Install the Iran side from the foreign server only.** `install.sh` now asks "Set up an Iran server now?"; it needs just the Iran IP and root password,
   installs the panel over SSH (password via askpass, temporary key removed afterwards), negotiates GRE6 -> GRE4 -> direct with a real traffic test,

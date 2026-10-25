@@ -45,7 +45,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 CONF_DIR = os.environ.get("FWPANEL_DIR", "/etc/fwpanel")
 DRY = os.environ.get("FWPANEL_DRY") == "1"
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -89,8 +89,21 @@ def ensure_admin_token():
     return tok
 
 
-def admin_token_ok(token, client_ip):
-    if not token or client_ip not in ("127.0.0.1", "::1"):
+def is_local_peer(client_ip, server_ip=None):
+    """Loopback, or one of this machine's own addresses (a blanket MASQUERADE rule rewrites local connections to the public IP)."""
+    if client_ip in ("127.0.0.1", "::1"):
+        return True
+    try:
+        fam = socket.AF_INET6 if ":" in client_ip else socket.AF_INET
+        with socket.socket(fam, socket.SOCK_STREAM) as s:
+            s.bind((client_ip, 0))                    # only succeeds for an address that belongs to this host
+        return server_ip in ("127.0.0.1", "::1", client_ip)
+    except (OSError, ValueError):
+        return False
+
+
+def admin_token_ok(token, client_ip, server_ip=None):
+    if not token or not is_local_peer(client_ip, server_ip):
         return False
     try:
         with open(ADMIN_TOKEN_FILE) as f:
@@ -1721,7 +1734,7 @@ class Handler(BaseHTTPRequestHandler):
         return c["fwp_sid"].value if "fwp_sid" in c else None
 
     def _authed(self):
-        if admin_token_ok(self.headers.get("X-Admin-Token"), self.client_address[0]):
+        if admin_token_ok(self.headers.get("X-Admin-Token"), self.client_address[0], self.request.getsockname()[0]):
             return True
         t = self._token()
         with LOCK:
@@ -1742,7 +1755,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- routing
     def _gate(self, path):
-        if path != "/api/sync" and not path.startswith("/dl/") and self.client_address[0] not in ("127.0.0.1", "::1") and not ip_allowed(self.client_address[0]):
+        if path != "/api/sync" and not path.startswith("/dl/") and not is_local_peer(self.client_address[0], self.request.getsockname()[0]) and not ip_allowed(self.client_address[0]):
             self._err(403, "forbidden")
             return False
         return True
